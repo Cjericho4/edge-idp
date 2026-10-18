@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "extends": ["./node_modules/@tjohnson/abacus/configs/oxlint/cloudflare-worker.json"],
+  "ignorePatterns": [
+    "dist/**",
+    "node_modules/**",
+    ".wrangler/**",
+    ".dependency-cruiser.cjs",
+    "src/assets.gen.ts",
+    "tests/e2e/**",
+    "scripts/**",
+    "tests/security/**",
+    "docs/archive/**"
+  ],
+  "rules": {},
+  "overrides": [
+    {
+      "files": ["tests/smoke/**"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    }
+  ]
+}

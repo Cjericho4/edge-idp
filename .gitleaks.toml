@@ -1,0 +1,23 @@
+# gitleaks allowlist for this repo — abacus secrets reads it automatically.
+# Extends gitleaks' default rules; add fingerprints or patterns of known
+# false positives below so the gate stays green.
+# Get a fingerprint: gitleaks detect --source . --report-format json | jq '.[].Fingerprint'
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "redacted placeholder values are not secrets"
+regexes = ["<redacted>"]
+
+[[allowlists]]
+description = "wrangler dev/build output is gitignored and regenerated"
+paths = ["\\.wrangler/.*"]
+
+[[allowlists]]
+description = "passkey provider AAGUIDs are public authenticator model ids, not secrets"
+paths = ["src/aaguid\\.ts"]
+
+[[allowlists]]
+description = "cf build output/types are gitignored and regenerated"
+paths = ["\\.cloudflare/.*"]

@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+dist/
+*.log
+.DS_Store
+
+# e2e outputs
+.e2e/
+
+# cf CLI generated output/types
+.cloudflare/

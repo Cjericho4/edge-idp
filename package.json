@@ -1,0 +1,85 @@
+{
+  "name": "edge-idp",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Personal passkey-only OIDC identity provider on Cloudflare Workers + D1",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build:client && cf dev",
+    "build:client": "node scripts/build-client.mjs",
+    "test": "vitest run",
+    "test:e2e": "node tests/e2e/full.mjs && node tests/e2e/api.mjs",
+    "test:e2e:setup": "node tests/e2e/setup.mjs",
+    "test:e2e:staging": "E2E_STAGE=staging node tests/e2e/full.mjs",
+    "test:security": "for f in tests/security/*.mjs; do node \"$f\" || exit 1; done",
+    "smoke": "node scripts/smoke.mjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
+    "typecheck:e2e": "tsc -p tsconfig.e2e.json",
+    "gates": "abacus check",
+    "lint": "oxlint --type-aware",
+    "fmt": "abacus fmt",
+    "fmt:check": "abacus fmt --check",
+    "abc": "abacus abc",
+    "size": "abacus size",
+    "ratchet": "abacus ratchet",
+    "tsc": "abacus tsc",
+    "deadcode": "abacus deadcode",
+    "secrets": "abacus secrets",
+    "cycles": "abacus cycles",
+    "dupes": "abacus dupes",
+    "todos": "abacus todos",
+    "db:migrate": "node scripts/db-migrate.mjs",
+    "db:migrate:local": "node scripts/db-migrate.mjs --local",
+    "seed:admin": "node scripts/seed-admin.mjs",
+    "deploy:check": "npm run build:client && cf deploy --dry-run",
+    "deploy": "node scripts/deploy.mjs",
+    "staging:migrate": "node scripts/db-migrate.mjs --stage=staging",
+    "staging:deploy": "npm run build:client && cf deploy --mode staging"
+  },
+  "dependencies": {
+    "@sentry/cloudflare": "^11.4.0",
+    "@simplewebauthn/browser": "^14.0.0",
+    "@simplewebauthn/server": "^14.0.2",
+    "hono": "^4.7.0",
+    "jose": "^6.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.0",
+    "@tjohnson/abacus": "github:tannerwj/abacus",
+    "@types/node": "^26.6.4",
+    "cf": "^1.0.0-beta.13",
+    "e2e": "^0.18.0",
+    "esbuild": "^0.28.2",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "oxlint-tsgolint": "^7.0.2003",
+    "playwright": "^1.63.0",
+    "qrcode-generator": "^2.0.4",
+    "typescript": "^5.8.0",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.0.0"
+  },
+  "overrides": {
+    "sharp": "^0.35.5"
+  },
+  "cloudflare": {
+    "bindings": {
+      "SETUP_TOKEN": {
+        "description": "Generate a 32-byte random base64url secret with `node scripts/gen-setup-token.mjs`. Enter it at **/setup**, then retain and back it up: portable installs use it to encrypt their D1 signing key."
+      },
+      "DB": {
+        "description": "Users, passkeys, sessions, clients and the audit log. Migrations run on every deploy."
+      },
+      "RP_NAME": {
+        "description": "The name people see on the sign-in page and in their passkey manager, e.g. `Smith Family ID`."
+      },
+      "AUTH_LIMITER": {
+        "description": "Per-IP rate limit for passkey ceremonies and setup."
+      },
+      "API_LIMITER": {
+        "description": "Per-IP rate limit for token and MCP traffic."
+      }
+    }
+  }
+}

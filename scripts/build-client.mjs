@@ -1,0 +1,34 @@
+import esbuild from "esbuild";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+
+const { outputFiles } = await esbuild.build({
+  entryPoints: ["src/client/app.ts"],
+  bundle: true,
+  minify: true,
+  format: "iife",
+  target: "es2020",
+  outfile: "app.js",
+  write: false,
+  logLevel: "warning",
+});
+
+const js = outputFiles[0].text;
+const { code: css } = await esbuild.transform(readFileSync("src/client/app.css", "utf8"), {
+  loader: "css",
+  minify: true,
+});
+const { version } = JSON.parse(readFileSync("package.json", "utf8"));
+const buildHash = createHash("sha256").update(js).update(css).digest("hex").slice(0, 10);
+
+writeFileSync(
+  "src/assets.gen.ts",
+  `export const BUILD_HASH = ${JSON.stringify(buildHash)};\n` +
+    `export const VERSION = ${JSON.stringify(version)};\n` +
+    `export const APP_CSS = ${JSON.stringify(css)};\n` +
+    `export const APP_JS = ${JSON.stringify(js)};\n`,
+);
+
+console.log(
+  `client built: app.js ${(js.length / 1024).toFixed(1)}kb, app.css ${(css.length / 1024).toFixed(1)}kb, hash ${buildHash}`,
+);
