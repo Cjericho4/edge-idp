@@ -139,6 +139,7 @@ src/
   mcp/tools-apps.ts     client, app, audit and settings tools
   mcp/tools-access.ts   app templates, apps_connect, app group, grant, access-explain and
                         Cloudflare Access listing tools
+  mcp/tools-feedback.ts feedback_submit, feedback_list and feedback_resolve (agent-filed problem reports)
   mcp/sandbox.ts        execute code mode: Dynamic Worker sandbox and its host RPC entrypoint
   ops.ts                domain operations shared by the admin UI and MCP (users, groups)
   ops-core.ts           OpError, Actor, shared parsing helpers
@@ -331,6 +332,23 @@ same domain operations as the admin UI (see [Domain operations](#domain-operatio
 `metrics_summary` computes p50/p95 in JavaScript because percentiles need
 ordered values; durations are fetched per tool, bounded at 1000 rows.
 
+**Agent feedback.** `feedback_submit` lets an agent that hit a failing tool, a
+misleading description or a missing capability file a report (kind, summary,
+optional tool name and details) into `mcp_feedback`, so the server can be
+improved from real use. The server `instructions` point agents at it, and its
+description asks for repro steps and a suggested fix and forbids secrets and
+personal data. Summary is capped at 200 characters, tool name at 100 and
+details at 4000, and over-long input is refused rather than truncated so the
+agent knows. Each report
+records the `VERSION` it was filed against, so a report from before a fix
+shipped can be told apart from a regression. Reports stay open until
+`feedback_resolve` closes them with a note; `feedback_list` returns open
+reports by default, and the admin MCP activity page shows the open ones
+(`src/mcp/tools-feedback.ts`, `src/admin/metrics.tsx`). Submitting and listing
+are `write: false`, so read-only tokens can file reports too; resolving needs
+the `mcp` scope (see THREAT_MODEL › Admin API (MCP) credentials). The loop a
+coding agent follows to act on reports is in AGENTS.md.
+
 **Code mode.** The `execute` tool runs a model-written JavaScript snippet in an
 isolated Dynamic Worker that calls IdP tools through a typed `id` proxy.
 Intermediate results never re-enter model context; only the final return
@@ -488,6 +506,8 @@ no user-facing request pays for a table scan. One D1 batch
   50,000th-newest id (an id comparison that uses the primary key, instead of a
   `NOT IN (… LIMIT n)` scan);
 - `mcp_calls` older than 30 days;
+- `mcp_feedback` older than 180 days, and everything older than the
+  1,000th-newest id;
 - secret pickups past their 10-minute expiry;
 - dynamically registered (DCR) clients older than 30 days that never received
   a consent.
