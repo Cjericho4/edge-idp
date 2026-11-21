@@ -10,7 +10,8 @@ Code references use the form `src/file.ts › symbol`.
 ## Overview
 
 edge-idp is one Cloudflare Worker (Hono, server-rendered JSX) backed by one D1
-database. It is a passkey-only OpenID Connect provider, an OAuth 2.1
+database. It is a passkey-first OpenID Connect provider (no passwords; email
+sign-in links are an opt-in for members), an OAuth 2.1
 authorization server for MCP clients, an admin UI, and an admin MCP server.
 There is no separate frontend build or SPA: the browser gets server-rendered
 HTML plus one small script and one stylesheet, both served by the Worker
@@ -23,12 +24,16 @@ keeps the project portable (`src/config.ts › Env`).
 
 ## Request lifecycle
 
-Every request passes through one global middleware, in this order
-(`src/index.tsx › global middleware`):
+Every request passes through two global middlewares
+(`src/index.tsx › global middleware`). The outer one only adds security
+headers to whatever the inner one or a handler returns, early refusals
+included (step 8). The inner one runs in this order:
 
 1. **Trailing slash.** A GET with a trailing slash (other than `/`) gets a 301
    to the path without it, so each page has one URL and auth checks see one
-   form of each path.
+   form of each path. The static assets (`/app.js`, `/app.css`, the favicon)
+   skip steps 2–6 and go straight to their handler: they need no
+   configuration, so they never cost a D1 read (`STATIC_PATHS`).
 2. **Resolve env.** `resolveEnv` fills in `ISSUER`, `RP_NAME` and
    `SIGNING_KEY_JWK` for this request, then `assertConfigured` checks them. A
    failure returns 500 "Server misconfigured" (see
@@ -44,15 +49,24 @@ Every request passes through one global middleware, in this order
    requests.
 6. **Rate limits.** See below.
 7. **Handler.**
-8. **Security headers** on every response, static assets included: HSTS,
-   `nosniff`, `X-Frame-Options: DENY`, COOP, a Permissions-Policy that allows
-   WebAuthn only for this origin, the strict CSP, and `cache-control:
-   no-store` on HTML that didn't set its own.
+8. **Security headers** on every response, static assets and early refusals
+   included: HSTS, `nosniff`, `X-Frame-Options: DENY`, COOP, a
+   Permissions-Policy that allows WebAuthn only for this origin, the strict
+   CSP, `Referrer-Policy: strict-origin-when-cross-origin` unless the route set
+   its own (the enrollment and setup pages send `no-referrer`), and
+   `cache-control: no-store` on HTML that didn't set its own
+   (`src/index.tsx › securityHeaders`).
 
-The middleware returns `Response | void` on purpose (short-circuit or pass
-through), which is why it carries an
-`eslint-disable-next-line typescript/consistent-return` directive. The admin
-middleware follows the same pattern (`src/admin/index.ts › admin.use`).
+`/healthz` deliberately goes through steps 2–6: it is a readiness check that
+answers 500 when configuration or the database is broken, which the setup
+suite relies on.
+
+The admin middleware returns `Response | void` on purpose (short-circuit or
+pass through), which is why it carries an
+`eslint-disable-next-line typescript/consistent-return` directive
+(`src/admin/index.ts › admin.use`). It also sends sensitive admin POSTs
+without a recent passkey recheck to `/login?reauth=1`, back to the page the
+admin was on (THREAT_MODEL › Sessions and cross-origin requests).
 
 **Rate limiting** uses the optional Workers Rate Limiting bindings with two
 budgets (`src/index.tsx › limiterFor`):
@@ -73,8 +87,9 @@ prefixes. Unhandled errors go to Sentry (when `SENTRY_DSN` is set) and render a
 generic 500.
 
 **Scheduled work.** The same Worker exports a `scheduled` handler for the
-hourly cron (minute 17). It runs maintenance and the upstream update check
-(see [Data model](#data-model-and-maintenance)).
+hourly cron (minute 17). It runs maintenance, scheduled signing-key rotation
+(`src/key-rotation.ts › autoRotate`) and the upstream update check (see
+[Data model](#data-model-and-maintenance)).
 
 ## Configuration and per-request env
 
@@ -96,12 +111,21 @@ for that reason, even though the raw values can be missing
   (`CF_API_TOKEN`, `CF_ACCOUNT_ID`) win over the stored ones. The settings are
   read through a per-isolate cache that lives 10 seconds; a save invalidates
   it in the isolate that handled it, so other isolates catch up within a
-  few seconds (`src/settings-cache.ts › getInstanceSettings`).
+  few seconds (`src/settings-cache.ts › getInstanceSettings`). The same cache
+  carries the two security settings, the admin recheck window and the sign-in
+  user-verification policy.
 - **Signing key:** falls back to the encrypted key in D1. Isolates that start
   at the same moment converge on one key: each runs `INSERT OR IGNORE` into
   `signing_keys` (id `current`) and reads the row back. The row is read on
   every request rather than cached, so a replaced key shows up in all isolates
-  (`src/instance.ts › storedSigningKey`). The stored format is
+  (`src/instance.ts › storedSigningKey`). The issuer pin and the key row are
+  read in one D1 batch, and only the ones the Worker config doesn't already
+  provide, so a portable install pays one round trip per request and the
+  reference install none (`src/instance.ts › instanceRows`). With a database
+  key, the same batch reads the retiring `previous` row (until its
+  `retire_at`) and resolves it as `SIGNING_KEY_JWK_PREVIOUS`, and
+  `SIGNING_KEY_SOURCE` records which kind of key this is, so the settings page
+  knows what it can offer (`src/instance.ts › keysFor`). The stored format is
   `enc:v1:<iv>:<ciphertext>`, AES-GCM with a 12-byte random IV under
   SHA-256(`"edge-idp signing key v1\0"` + `SETUP_TOKEN`).
 
@@ -153,17 +177,36 @@ src/
   signup.ts             public sign-up: /webauthn/signup/* for clients open to the public
   maintenance.ts        hourly retention and cleanup
   upstream.ts           daily upstream version check and feedback links
-  settings-cache.ts     per-isolate cache of instance settings (name, accent, Cloudflare connection)
+  settings-cache.ts     per-isolate cache of every instance setting, parsed with defaults
+  email.ts              optional outgoing email: status, rendering, sending through the EMAIL binding
+  invites.ts            invite and enrollment-link emails, pending invites, bulk-invite parsing
+  email-change.ts       self-service email change: confirmation link and notice
+  account-email.tsx     /account/email routes (start, confirm)
+  recovery.ts           "lost my passkey" requests: automatic links, approval, dismissal
+  recover.tsx           public /recover pages
+  magic-link.ts         email sign-in links: send, peek, redeem
+  login-link.tsx        /login/email and /login/link routes
+  pages-flow.tsx        pages for emailed-link flows (token form, done)
+  notify.ts             audit-event fan-out: admin alert emails, webhooks, security notices
+  ops-notify.ts         alert settings and webhook management
+  outbound.ts           guarded outbound POSTs (webhooks, logout tokens): URL rules, timeout, no redirects
+  app-logout.ts         back-channel logout tokens and Cloudflare Access revocation on sign-out-everywhere
+  key-rotation.ts       database-held signing key: rotate, move from a secret, scheduled rotation
+  backup.ts             backup export, parsing and restore
+  request-context.ts    per-request scope (env + waitUntil) via AsyncLocalStorage
   cf-access.ts          optional read-only Cloudflare Access integration
   util.ts               small pure helpers (encoding, hashing, comparisons)
   account.tsx           Account & security routes
   account-sections.tsx  Account & security views
   home.tsx              home launcher: app-group sections, favorites, search
   pages.tsx             sign-in, enrollment, consent, sign-out, error pages
-  admin/                admin UI: index (router, middleware), shell, dashboard, users, user-detail,
+  admin/                admin UI: index (router, middleware), shell, dashboard, users, invites, recovery,
+                        client-policy, user-detail,
                         user-tabs, groups, apps (+ apps-form, apps-access grants and app groups,
                         apps-cloudflare import view), clients,
-                        client-detail, audit, connect, tokens, metrics, settings
+                        client-detail, audit, connect, tokens, metrics, settings/ (one module per tab
+                        plus shell: general, sign-in, email, notifications, clients, keys, backup,
+                        cloudflare, about)
   ui/                   layout (document, flash), components, icons, activity feed
   client/               browser bundle: app.ts entry, ui.ts, dom.ts, passkeys.ts, palette.ts, app.css
   assets.gen.ts         generated: bundled app.js/app.css, build hash, version
@@ -201,8 +244,18 @@ sessions are created only by a passkey ceremony, so creation time is
 authentication time. Expiry slides at most once a minute, and the write runs
 in the background (`waitUntil`) with errors swallowed, so a page that makes
 several fetches doesn't rewrite the row each time and a failed slide never
-fails the request (`src/session.ts › getSession`). Step-up is a separate
-timestamp on the session (`step_up_at`), set only by an explicit recheck.
+fails the request (`src/session.ts › getSession`). The session and its user
+come back in one joined query. Each session records how it was made
+(`method`: `passkey`, or `email` for a sign-in link); `/authorize` copies it
+onto the code, the code grant onto the refresh token, and the ID token's
+`amr` follows it. The admin middleware sends an `email` session to sign in
+with a passkey. `createSession` takes an options object
+(`userAgent`, `ip`, `credentialId`, `stepUp`, `method`). Step-up is a separate timestamp on the session
+(`step_up_at`), set only by an explicit recheck: a sign-in started from
+`/login?reauth=1` asks `/webauthn/auth/options` for a `stepUp` challenge, and
+the challenge row, not the verify request, decides that the new session is a
+recheck. Registration and sign-up end the old session before starting the new
+one, like sign-in does.
 
 **Signing keys.** The loader keeps two CryptoKeys: the private key, used only
 for signing, and a public verify key derived from the private JWK's `n`/`e`,
@@ -288,6 +341,13 @@ the client id (`src/oidc.tsx › normalizeResource`,
 - When `/authorize` sends the user to sign in, the resume URL drops
   `prompt=login` so the request doesn't loop back to the login page after the
   ceremony (`src/oidc.tsx › resumeUrl`).
+- `/authorize`, `/token` and `/userinfo` load the user, their groups, the apps
+  and the grants once, in one parallel round
+  (`src/access.ts › loadUserContext`). The client policy and the claims are
+  then plain functions of that context (`src/oauth-shared.ts ›
+  clientAccessProblem, claimsFor`), and the code grant writes its refresh
+  token, the person's app sign-in (`client_signins`, for back-channel logout)
+  and its audit row in one batch.
 - A refresh request may narrow scope but never widen it. For clients that
   aren't admin-registered, refresh also checks that the user's consent grant
   still exists (`src/oauth-token.ts › refreshGrant`).
@@ -326,10 +386,14 @@ callers. Tool calls are recorded in `mcp_calls` fire-and-forget via
 retention (`src/mcp/common.ts › trackCall`).
 
 **Tools.** Tools are plain definitions with a JSON input schema, grouped in
-`tools-people.ts` and `tools-apps.ts` and registered in `TOOLS`. They call the
+`tools-people.ts`, `tools-apps.ts` and `tools-access.ts` and registered in
+`TOOLS`. They call the
 same domain operations as the admin UI (see [Domain operations](#domain-operations-and-admin-ui)).
-`metrics_summary` computes p50/p95 in JavaScript because percentiles need
-ordered values; durations are fetched per tool, bounded at 1000 rows.
+`metrics_summary` reads the last day's calls in three queries (every
+duration sorted by tool, the error counts, the `execute` runs) and computes
+counts, averages and p50/p95 in JavaScript, because percentiles need ordered
+values. The percentiles cover every call, not a sample
+(`src/mcp/tools.ts › summarize`).
 
 **Code mode.** The `execute` tool runs a model-written JavaScript snippet in an
 isolated Dynamic Worker that calls IdP tools through a typed `id` proxy.
@@ -414,11 +478,21 @@ describe each app: its callback paths, whether it can do PKCE, and its
 settings, as environment variables (Grafana, Open WebUI, LiteLLM, Paperless-ngx; Grafana
 also gets its SSO settings API body) or form fields (Immich, any OIDC app). Roles map
 onto each app's own model, for example `admin`/`writer` to Grafana
-Admin/Editor and everything else to Viewer. Running it again on a connected
-app rotates the secret and refreshes the redirect URIs, so a failed setup can
-simply be retried. A new tile gets the groups passed in as grants; with none,
+Admin/Editor and everything else to Viewer. The connection plan validates redirect URIs and group names before writing.
+Admin → Connect and MCP use the same operation. Preview returns the proposed
+configuration. For a new connection one D1 batch commits the tile, grants,
+client, link, pickup and audit event. A normalized base URL identifies a new
+tile across retries. Existing tiles can also be selected explicitly. Concurrent
+calls converge on the linked client. A repeat returns configuration with no
+pickup, and conflicting redirect or PKCE requirements need an explicit client
+edit. Use client rotation to replace a lost pickup. A new tile gets the groups passed in as grants; with none,
 an app group's grants cover it, or everyone if it has no app group. Tiles open in a
 new tab so the launcher stays put as a home base (`src/home.tsx › AppTile`).
+Admin → People → App access and MCP `access_explain` with an app use
+`src/access-inspection.ts › inspectAccess`, the same client eligibility and
+claim functions as sign-in. The app catalog's editor links select one
+server-rendered dialog per request.
+
 The launcher shows one section per app group (in the admin's order), then
 ungrouped apps, with the user's favorites first; a favorite is a per-user row
 that can only be set on an app the user can see, and it goes away with the app
@@ -435,7 +509,9 @@ bookmarks keep working.
 
 **Cloudflare Access integration** (`src/cf-access.ts`) is read-only. It lists
 Access applications, shows which ones sign in through this IdP and which
-groups their policies require, and imports them into the launcher. The MCP
+policy conditions appear in their rules. Import shows the selected audience
+and qualifying people. The operator explicitly chooses local groups, all
+members or nobody. Unrecognized conditions never seed grants. The MCP
 tool `cloudflare_access_apps` returns the same listing; the token itself never
 leaves the server. An import
 records the Access app id on the tile (`cf_app_id`), which is how the list
@@ -457,7 +533,8 @@ attempt per day rather than one per hour.
 
 Migrations in `migrations/` are additive and applied manually (or by
 `npm run deploy` under Workers Builds), so the previous Worker version keeps
-running on the new schema during a rollback.
+running on the new schema during a rollback. `npm run db:check` (run in CI)
+fails on any `DROP` or `RENAME` in a migration (`scripts/check-migrations.mjs`).
 
 **D1 quirks.**
 
@@ -484,17 +561,40 @@ no user-facing request pays for a table scan. One D1 batch
 - enrollment tokens that are used, or more than 7 days past expiry;
 - refresh tokens that expired, or were rotated more than a day ago (kept that
   long so reuse detection still recognizes them);
-- audit events older than 365 days, and everything older than the
-  50,000th-newest id (an id comparison that uses the primary key, instead of a
-  `NOT IN (… LIMIT n)` scan);
+- audit events older than 365 days, and everything at or below
+  `MAX(id) - 50000`, which reads two primary-key entries instead of walking
+  50,000 rows. Ids only ever leave from the bottom, so gaps can only make it
+  keep more than 50,000, never fewer;
 - `mcp_calls` older than 30 days;
-- secret pickups past their 10-minute expiry;
+- secret pickups past their 10-minute expiry, pending email changes past
+  their 1-hour expiry, and sign-in links past their 10-minute expiry;
+- a retired previous signing key;
 - dynamically registered (DCR) clients older than 30 days that never received
   a consent.
 
-**Caches.** Instance settings (name, accent, Cloudflare connection) change only
-by admin action, so they are cached per isolate for 10 seconds instead of costing a D1 read on every request; a change
-can take up to 10 seconds to reach other isolates (`src/settings-cache.ts`).
+**Indexes.** Migration 0014 indexes the foreign keys that cascades and the
+DCR cleanup scan (`refresh_tokens.client_id`, `auth_codes.user_id` and
+`client_id`, `mcp_calls.token_id`, `oauth_grants.client_id`,
+`app_favorites.app_id`, `audit_log.client_id`) and `lower(users.email)`, the
+expression `getUserByEmail` looks up.
+
+**Caches.** Instance settings change only by admin action, so the whole
+`instance_settings` table (a few dozen rows at most) is read in one query,
+parsed into typed values with defaults, and cached per isolate for 10 seconds
+instead of costing a D1 read on every request; a change can take up to 10
+seconds to reach other isolates (`src/settings-cache.ts › parseSettings,
+getInstanceSettings`). Every reader goes through it, including the DCR and
+CIMD switches.
+
+**Email** (`src/email.ts`) is optional and goes through the `EMAIL`
+`send_email` binding. `emailStatus` is one of `no-binding`, `no-sender`,
+`off` and `ready`; only `ready` sends. `sendMail` never throws: it returns
+`{ ok: false, error }` so callers can fall back to showing a link. Messages
+are built with Hono's `html` template, which escapes every interpolated
+value, and always carry a plain-text part. Email HTML uses inline styles
+because mail clients ignore stylesheets; the no-inline-style rule is about
+pages served under the CSP. Under `cf dev` the binding is simulated and the
+e2e harness reads messages back from the log (TESTING.md).
 
 ## UI conventions
 
@@ -512,7 +612,13 @@ Components render no behavior of their own (`src/ui/layout.tsx`,
   real `<a>` so keyboard and assistive-technology users get a normal link;
   clicks on interactive elements inside the row are ignored;
 - timestamps are rendered relative, in the viewer's locale, by `app.js`;
-- `data-copy` copies a value.
+- `data-copy` copies a value;
+- `form[data-fragment-token]` is how emailed links reach the server without
+  putting a bearer token in a URL path: the link carries the token in the
+  `#fragment`, the page's script copies it into the form's hidden `token`
+  input and strips it from the address bar, and the person submits the form
+  (`src/client/ui.ts › initFragmentToken`, `src/pages-flow.tsx › TokenFormPage`).
+  Enrollment links predate this and do the same thing in `passkeys.ts`.
 
 **Styling without inline styles.** Every visual variant is a CSS class or data
 attribute. Dashboard sparkline bars are bucketed 0 to 19 (5% steps) on the
@@ -521,6 +627,29 @@ server and emitted as `data-v`, with one stylesheet rule per bucket
 `[data-accent]`. Icons are inline SVG (24px grid, stroke-based, shapes after
 Lucide, ISC licensed), so they inherit `currentColor` and need no extra
 requests or CSP allowances (`src/ui/icons.tsx`).
+
+**Notifications.** `audit()` calls one registered listener after writing the
+row (`src/db.ts › onAudit`); `startNotifications` registers it at startup.
+The listener needs the resolved env and the request's `waitUntil`, which
+`audit()`'s callers don't pass around, so the global middleware runs every
+request inside a scope holding both (`src/request-context.ts › withScope`,
+AsyncLocalStorage from `nodejs_compat`). Sandbox tool calls open their own
+scope, since they arrive on a separate RPC invocation. Events written with
+`auditStmt` inside a batch (`CODE_ISSUED`, `TOKEN_ISSUED`) don't notify, and
+neither does the cron, which has no scope. `dispatch` reads the cached
+settings, then sends notices, admin emails and webhooks concurrently with
+`Promise.allSettled`, and records each webhook's last status for the
+settings page (`src/notify.ts`).
+
+**Settings pages.** Settings is a set of tabs, one module each under
+`src/admin/settings/`, sharing `settingsPage` for the layout: a sticky
+sub-navigation on the left (a scrolling strip on phones) with a status badge
+per tab (Email on/off/not set up, Sign-in "Relaxed", Cloudflare connected),
+and the tab's cards on the right. Each card is its own form posting to its
+own route, so saving one never resets another. Mutually exclusive options
+are `ChoiceList` radio cards with a sentence per option, and options that
+weaken security are marked `warn` (amber when selected). Every POST under
+`/admin/settings` needs the admin recheck (`src/admin/index.ts › SENSITIVE`).
 
 **Small decisions worth knowing.**
 
@@ -531,7 +660,7 @@ requests or CSP allowances (`src/ui/icons.tsx`).
   synchronously, because disabling synchronously drops the clicked button's
   name and value from the submission (`src/client/ui.ts`).
 - On load the client removes `?ok=…` flash codes from the address bar so a
-  reload doesn't show the toast again (`src/client/app.ts › boot`).
+  reload doesn't show the toast again (`src/client/app.ts`, top level).
 - The home greeting is time-neutral ("Welcome back") because the server only
   knows UTC, not the viewer's clock (`src/home.tsx › greeting`).
 - The command palette validates the `/admin/palette.json` index rather than
@@ -556,8 +685,26 @@ and `deploy` (`scripts/build-client.mjs`).
   gates` (abacus, configured in `abacus.config.json`: lint, ABC complexity,
   tsc, dead code, secrets, import cycles, duplicates, TODOs, and a ratchet
   that keeps size and complexity from growing), and oxfmt for formatting. CI runs typecheck, `typecheck:e2e`,
-  `fmt:check`, unit tests and gates on push and PRs; the e2e suites run
-  locally (see TESTING.md).
+  `fmt:check`, unit tests, gates, `npm run db:check` and
+  `npm audit --audit-level=high` on push and PRs. CI also checks generated assets, the portable Worker bundle size,
+  browser and API flows, one-click setup, security regressions and local smoke. Actions are pinned to commit SHAs
+  (`actions/checkout` v5.1.0, `actions/setup-node` v5.0.0), and
+  `@tjohnson/abacus` and `cf` to exact versions, so a moved tag or a new
+  prerelease can't change what CI runs. Update a pin by resolving the new tag
+  with `git ls-remote --tags https://github.com/actions/<name>`.
+- **Gate configs.** The import-cycle gate uses `.dependency-cruiser.cjs` with
+  rules for cycles and unresolved imports. Package exports resolve with the import
+  condition. The runtime-provided `cloudflare:workers` module is an external leaf. The
+  secrets gate reads `.gitleaks.toml`, which extends gitleaks' default rules
+  with allowlists for `<redacted>` placeholders, the gitignored `.wrangler/`
+  and `.cloudflare/` build output, and AAGUID-shaped UUIDs in
+  `src/aaguid.ts` (public authenticator model ids). For a new false positive,
+  get its fingerprint with
+  `gitleaks detect --source . --report-format json | jq '.[].Fingerprint'`
+  and allowlist that rather than a whole path.
+- **Config files carry no comments.** `wrangler.jsonc` is the one-click
+  template; what to change in it (a custom `ISSUER`, `UPSTREAM_REPO`, the
+  optional `worker_loaders` binding for code mode) is in DEPLOY.md.
 - **Stage config is parsed as text.** `STAGES` in `cloudflare.config.ts` is
   the single source of truth for each stage's Worker name, issuer and D1 id.
   Scripts and the e2e harness read it with `stageConfig`, which uses regexes
@@ -577,3 +724,5 @@ Remove each when its condition is met.
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
 | `cfJson` reads stdout until it parses as JSON, then stops the whole process group and waits for it to exit (60 s default timeout) (`scripts/cf-local.mjs › cfJson`, `stopGroup`) | `cf d1 … --local` prints its result but leaves its local Miniflare running. Run through `npx`, killing only the wrapper orphans `cf` and its engine, which keep the D1 files open and make later local SQL fail with `[10000] Network connection lost` | `cf d1 --local` exits on its own                |
 | Local migrations and seeding pass `--persist-to .wrangler/state` (`scripts/db-migrate.mjs`, `scripts/cf-local.mjs › migrateLocal`)                                               | `cf dev` reads local D1 from `.wrangler/state`, but `cf d1 --local` defaults elsewhere                                                                                                                                                                 | `cf dev` and `cf d1 --local` agree on a default |
+| Local `sqlRows` retries up to twice, 500 ms apart, when `cf d1 raw --local` fails with `[10000] Network connection lost` (`scripts/cf-local.mjs › sqlRows`)                      | `cf`'s local D1 bridge drops a connection now and then even with no orphaned process, which failed long e2e runs at random                                                                                                                             | `cf d1 --local` stops dropping connections      |
+| The Worker bundle is minified only on the `wrangler.jsonc` path (`"minify": true`, with source maps uploaded so stack traces stay readable)                                      | `cf`'s config has no minify option, so the reference deploy ships unminified (about 1.8 MB raw, 383 KB gzip vs 935 KB / 281 KB)                                                                                                                        | `cf` exposes minify                             |

@@ -59,11 +59,32 @@ const EVENTS: Record<string, { label: string; icon: IconName; tone: Tone }> = {
   USER_MADE_MEMBER: { label: "Made a member", icon: "users", tone: "" },
   CLIENT_SECRET_PICKED_UP: { label: "Client secret picked up", icon: "key", tone: "" },
   SETTINGS_CHANGED: { label: "Settings changed", icon: "settings", tone: "" },
+  EMAIL_SETTINGS_CHANGED: { label: "Email settings changed", icon: "mail", tone: "" },
+  ENROLLMENT_REVOKED: { label: "Invite revoked", icon: "link", tone: "" },
+  EMAIL_CHANGE_REQUESTED: { label: "Asked to change email", icon: "mail", tone: "" },
+  EMAIL_CHANGED: { label: "Changed email", icon: "mail", tone: "warn" },
+  RECOVERY_REQUESTED: { label: "Asked for help signing in", icon: "key", tone: "warn" },
+  RECOVERY_LINK_SENT: { label: "Recovery link sent", icon: "key", tone: "warn" },
+  RECOVERY_DISMISSED: { label: "Sign-in help dismissed", icon: "key", tone: "" },
+  WEBHOOK_ADDED: { label: "Webhook added", icon: "zap", tone: "" },
+  WEBHOOK_REMOVED: { label: "Webhook removed", icon: "zap", tone: "" },
+  WEBHOOK_TEST: { label: "Webhook test", icon: "zap", tone: "" },
+  BACKCHANNEL_LOGOUT: { label: "Signed out of an app", icon: "logOut", tone: "" },
+  ACCESS_SESSIONS_REVOKED: { label: "Signed out of Cloudflare Access", icon: "cloud", tone: "" },
+  SIGNING_KEY_ROTATED: { label: "Signing key rotated", icon: "key", tone: "warn" },
+  SIGNING_KEY_MOVED: { label: "Signing key moved to the database", icon: "key", tone: "warn" },
+  BACKUP_EXPORTED: { label: "Backup downloaded", icon: "download", tone: "warn" },
+  BACKUP_IMPORTED: { label: "Backup imported", icon: "upload", tone: "warn" },
+  MAGIC_LINK_SENT: { label: "Sign-in link emailed", icon: "send", tone: "" },
+  MAGIC_LINK_SIGN_IN: { label: "Signed in with an email link", icon: "mail", tone: "warn" },
+  SECURITY_SETTINGS_CHANGED: { label: "Security settings changed", icon: "shield", tone: "warn" },
   CF_API_CONNECTED: { label: "Cloudflare connected", icon: "cloud", tone: "warn" },
   CF_API_DISCONNECTED: { label: "Cloudflare disconnected", icon: "cloud", tone: "" },
   THEME_CHANGED: { label: "Theme changed", icon: "settings", tone: "" },
   CLIENT_PKCE_TOGGLED: { label: "PKCE setting changed", icon: "plug", tone: "" },
 };
+
+export const EVENT_NAMES = Object.keys(EVENTS);
 
 export function eventMeta(event: string): { label: string; icon: IconName; tone: Tone } {
   return (

@@ -2,6 +2,7 @@ import { audit } from "./db";
 import type { App, OidcClient } from "./db";
 import { newId, nowSec, randomToken, sha256Hex } from "./util";
 import { by, OpError, parseGroupList, parseRedirectUris } from "./ops-core";
+import { outboundUrlProblem } from "./outbound";
 import { appGroupIdOf, checkSlug, seedAppGrants, uniqueSlug } from "./ops-access";
 import type { Actor } from "./ops-core";
 
@@ -21,11 +22,12 @@ export interface ClientInput {
   description?: string;
 }
 
-export async function createClient(
+export async function prepareClient(
   db: D1Database,
   input: ClientInput,
   a: Actor,
-): Promise<{ id: string; secret: string | null }> {
+  unlinkedApp?: string,
+) {
   const name = input.name.trim().slice(0, 120);
   if (!name) throw new OpError("Name is required.");
   const uris = parseRedirectUris(input.redirectUris);
@@ -34,12 +36,13 @@ export async function createClient(
   const env = knownEnv(input.environment) ? input.environment : "production";
   const id = randomToken(18);
   const secret = isPublic ? null : randomToken(32);
-  await db
+  const statement = db
     .prepare(
       `INSERT INTO oidc_clients
          (id, name, redirect_uris, secret_hash, secret_prefix, allowed_groups, require_pkce,
           environment, created_at, created_by, client_type, source, skip_consent, description)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'admin', 1, ?12)`,
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'admin', 1, ?12
+       WHERE ?13 IS NULL OR EXISTS (SELECT 1 FROM apps WHERE id = ?13 AND client_id IS NULL)`,
     )
     .bind(
       id,
@@ -54,9 +57,18 @@ export async function createClient(
       a.adminId,
       isPublic ? "public" : "confidential",
       input.description?.trim().slice(0, 300) || null,
-    )
-    .run();
-  await audit(db, "CLIENT_CREATED", { clientId: id, detail: by(a, { name }) });
+      unlinkedApp ?? null,
+    );
+  return { id, secret, statement };
+}
+
+export async function createClient(db: D1Database, input: ClientInput, a: Actor) {
+  const { id, secret, statement } = await prepareClient(db, input, a);
+  await statement.run();
+  await audit(db, "CLIENT_CREATED", {
+    clientId: id,
+    detail: by(a, { name: input.name.trim().slice(0, 120) }),
+  });
   return { id, secret };
 }
 
@@ -100,6 +112,36 @@ export async function updateClient(
     )
     .run();
   await audit(db, "CLIENT_UPDATED", { clientId: client.id, detail: by(a) });
+}
+
+export const MAX_AUTH_AGES = [0, 3600, 43200, 86400, 604800];
+
+export async function setClientSignInPolicy(
+  db: D1Database,
+  client: OidcClient,
+  input: { requirePasskey: boolean; maxAuthAge: number; backchannelUri: string; issuer: string },
+  a: Actor,
+): Promise<void> {
+  if (client.source !== "admin")
+    throw new OpError("Sign-in policy is for admin-registered clients.");
+  if (!MAX_AUTH_AGES.includes(input.maxAuthAge)) throw new OpError("Pick one of the offered ages.");
+  const uri = input.backchannelUri.trim();
+  const problem = uri ? outboundUrlProblem(uri, input.issuer) : null;
+  if (problem) throw new OpError(`Back-channel logout URL: ${problem}`);
+  await db
+    .prepare(
+      "UPDATE oidc_clients SET require_passkey = ?1, max_auth_age = ?2, backchannel_logout_uri = ?3 WHERE id = ?4",
+    )
+    .bind(input.requirePasskey ? 1 : 0, input.maxAuthAge || null, uri || null, client.id)
+    .run();
+  await audit(db, "CLIENT_UPDATED", {
+    clientId: client.id,
+    detail: by(a, {
+      requirePasskey: input.requirePasskey,
+      maxAuthAge: input.maxAuthAge,
+      backchannel: !!uri,
+    }),
+  });
 }
 
 export async function rotateClientSecret(

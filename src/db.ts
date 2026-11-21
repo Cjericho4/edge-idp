@@ -24,6 +24,7 @@ export interface WebAuthnCredential {
   backup_state: number;
   aaguid: string | null;
   created_at: number;
+  checked_at: number | null;
   last_used_at: number | null;
 }
 
@@ -50,6 +51,9 @@ export interface OidcClient {
   skip_consent: boolean;
   metadata_expires_at: number | null;
   public_signup: boolean;
+  require_passkey: boolean;
+  max_auth_age: number | null;
+  backchannel_logout_uri: string | null;
 }
 
 interface Row {
@@ -87,7 +91,7 @@ function strArray(v: unknown): string[] {
   return out;
 }
 
-function rowToUser(r: Row): User {
+export function rowToUser(r: Row): User {
   return {
     id: str(r.id),
     created_at: num(r.created_at),
@@ -169,6 +173,7 @@ export async function getCredentialsForUser(
     backup_state: num(r.backup_state),
     aaguid: strOrNull(r.aaguid),
     created_at: num(r.created_at),
+    checked_at: numOrNull(r.checked_at),
     last_used_at: numOrNull(r.last_used_at),
   }));
 }
@@ -194,6 +199,10 @@ function rowToClient(r: Row): OidcClient {
     skip_consent: r.skip_consent === undefined ? true : num(r.skip_consent) === 1,
     metadata_expires_at: numOrNull(r.metadata_expires_at),
     public_signup: r.public_signup === undefined ? false : num(r.public_signup) === 1,
+    require_passkey: r.require_passkey === undefined ? false : num(r.require_passkey) === 1,
+    max_auth_age: r.max_auth_age === undefined ? null : numOrNull(r.max_auth_age),
+    backchannel_logout_uri:
+      r.backchannel_logout_uri === undefined ? null : strOrNull(r.backchannel_logout_uri),
   };
 }
 
@@ -284,7 +293,7 @@ export async function getApp(db: D1Database, id: string): Promise<App | null> {
   return r ? rowToApp(r) : null;
 }
 
-export async function audit(
+export function auditStmt(
   db: D1Database,
   event: string,
   opts: {
@@ -294,8 +303,8 @@ export async function audit(
     userAgent?: string | null;
     detail?: Record<string, unknown>;
   } = {},
-): Promise<void> {
-  await db
+): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO audit_log (created_at, event, user_id, client_id, ip_hash, user_agent, detail)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
@@ -308,8 +317,21 @@ export async function audit(
       opts.ipHash ?? null,
       (opts.userAgent ?? null)?.slice(0, 300) ?? null,
       opts.detail ? JSON.stringify(opts.detail) : null,
-    )
-    .run();
+    );
+}
+
+export type AuditOpts = NonNullable<Parameters<typeof auditStmt>[2]>;
+
+type AuditListener = (event: string, opts: AuditOpts) => void;
+let listener: AuditListener | null = null;
+
+export function onAudit(fn: AuditListener): void {
+  listener = fn;
+}
+
+export async function audit(db: D1Database, event: string, opts: AuditOpts = {}): Promise<void> {
+  await auditStmt(db, event, opts).run();
+  listener?.(event, opts);
 }
 
 export async function getSetting(db: D1Database, key: string, fallback: string): Promise<string> {

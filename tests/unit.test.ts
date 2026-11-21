@@ -1,39 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { base64url, emailKey, rpIdFromIssuer, sha256Hex, timingSafeEqualHex } from "../src/util";
+import { emailKey, timingSafeEqualHex } from "../src/util";
 import { newerVersion } from "../src/upstream";
+import { parseBulk } from "../src/invites";
+import { parseBackup } from "../src/backup";
 import { claimsForClient, resolveAccess } from "../src/access";
 import type { Grant } from "../src/access";
-
-describe("base64url", () => {
-  it("encodes without padding or url-unsafe chars", () => {
-    const out = base64url(new Uint8Array([251, 255, 190, 0, 1]));
-    expect(out).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(out).not.toContain("=");
-  });
-
-  it("round-trips through atob", () => {
-    const bytes = new Uint8Array([1, 2, 3, 250, 255]);
-    const s = base64url(bytes);
-    const back = Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) =>
-      c.charCodeAt(0),
-    );
-    expect([...back]).toEqual([...bytes]);
-  });
-});
-
-describe("sha256Hex", () => {
-  it("matches the known vector", async () => {
-    expect(await sha256Hex("hello")).toBe(
-      "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-    );
-  });
-
-  it("accepts Uint8Array input identically", async () => {
-    const a = await sha256Hex("hello");
-    const b = await sha256Hex(new TextEncoder().encode("hello"));
-    expect(a).toBe(b);
-  });
-});
 
 describe("timingSafeEqualHex", () => {
   it("accepts equal strings", () => {
@@ -46,16 +17,6 @@ describe("timingSafeEqualHex", () => {
 
   it("rejects different lengths without throwing", () => {
     expect(timingSafeEqualHex("abc", "abcd")).toBe(false);
-  });
-});
-
-describe("rpIdFromIssuer", () => {
-  it("extracts the hostname", () => {
-    expect(rpIdFromIssuer("https://auth.example.com")).toBe("auth.example.com");
-  });
-
-  it("ignores ports and paths", () => {
-    expect(rpIdFromIssuer("https://auth.example.com:8443/x")).toBe("auth.example.com");
   });
 });
 
@@ -190,5 +151,83 @@ describe("claimsForClient", () => {
 
   it("gives an unlinked client the sorted app list without roles, skipping slugless apps", () => {
     expect(claimsForClient(apps, access, "c-access")).toEqual({ apps: ["grafana", "nas"] });
+  });
+});
+
+describe("parseBulk", () => {
+  it("reads Name <email>, email-then-name and name-then-email lines", () => {
+    const { people, errors } = parseBulk(
+      "Ada Lovelace <ada@example.com>\ngrace@example.com, Grace Hopper\nAlan Turing; alan@example.com",
+    );
+    expect(errors).toEqual([]);
+    expect(people).toEqual([
+      { name: "Ada Lovelace", email: "ada@example.com" },
+      { name: "Grace Hopper", email: "grace@example.com" },
+      { name: "Alan Turing", email: "alan@example.com" },
+    ]);
+  });
+
+  it("derives a name from a bare address and strips quotes", () => {
+    expect(parseBulk('mary.ann_smith@example.com\n"Bob" <bob@example.com>').people).toEqual([
+      { name: "mary ann smith", email: "mary.ann_smith@example.com" },
+      { name: "Bob", email: "bob@example.com" },
+    ]);
+  });
+
+  it("reports a line with no address instead of inviting a name", () => {
+    const { people, errors } = parseBulk("\n  \nJust A Name\n");
+    expect(people).toEqual([]);
+    expect(errors).toEqual(['No email address in "Just A Name"']);
+  });
+
+  it("refuses more than 50 people at once", () => {
+    const lines = Array.from({ length: 51 }, (_, i) => `p${i}@example.com`).join("\n");
+    expect(() => parseBulk(lines)).toThrow("at most 50");
+  });
+});
+
+const backupDoc = (tables: unknown, extra: Record<string, unknown> = {}) =>
+  JSON.stringify({ format: "edge-idp-backup", version: 1, tables, ...extra });
+
+describe("parseBackup", () => {
+  const doc = backupDoc;
+
+  it("refuses anything that isn't a version 1 edge-idp backup", () => {
+    expect(() => parseBackup("not json")).toThrow("isn't JSON");
+    expect(() => parseBackup(JSON.stringify({ format: "other", version: 1, tables: {} }))).toThrow(
+      "isn't an edge-idp backup",
+    );
+    expect(() => parseBackup(doc({}, { version: 2 }))).toThrow("newer version");
+    expect(() => parseBackup(JSON.stringify({ format: "edge-idp-backup", version: 1 }))).toThrow(
+      "no tables",
+    );
+  });
+
+  it("refuses column names that aren't plain identifiers", () => {
+    expect(() => parseBackup(doc({ groups: [{ "id) VALUES (1); --": "x" }] }))).toThrow(
+      "groups table is malformed",
+    );
+  });
+
+  it("refuses nested values other than base64url blobs", () => {
+    expect(() => parseBackup(doc({ users: [{ id: "u", extra: { a: 1 } }] }))).toThrow(
+      "users table is malformed",
+    );
+    expect(() =>
+      parseBackup(doc({ webauthn_credentials: [{ id: "c", public_key: { $b64: "a+b/" } }] })),
+    ).toThrow("webauthn_credentials table is malformed");
+  });
+
+  it("keeps known tables, defaults missing ones to empty, and ignores unknown ones", () => {
+    const b = parseBackup(
+      doc(
+        { groups: [{ id: "g", name: "family", created_at: 1 }], sessions: [{ id_hash: "x" }] },
+        { issuer: "https://id.example.com", rp_id: "id.example.com" },
+      ),
+    );
+    expect(b.tables.groups).toEqual([{ id: "g", name: "family", created_at: 1 }]);
+    expect(b.tables.users).toEqual([]);
+    expect(Object.keys(b.tables)).not.toContain("sessions");
+    expect(b.rp_id).toBe("id.example.com");
   });
 });

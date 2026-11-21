@@ -1,5 +1,7 @@
 import { getUserGroups, listGroups, listUsers } from "../db";
 import * as ops from "../ops";
+import { deliverLink, pendingInvites, revokeInvites } from "../invites";
+import { approveRecovery, dismissRecovery, pendingRecovery } from "../recovery";
 import { USER_REF, groupByRef, obj, str, strList, userByRef } from "./common";
 import type { ToolDef } from "./common";
 
@@ -86,13 +88,14 @@ export const PEOPLE_TOOLS: ToolDef[] = [
     name: "users_create",
     write: true,
     description:
-      "Create a user and return their one-time enrollment link (valid 7 days). Optionally put them in groups or make them an admin.",
+      "Create a user and return their one-time enrollment link (valid 7 days). Optionally put them in groups or make them an admin, and email them the invite (`send_email`, needs email set up in Settings).",
     inputSchema: obj(
       {
         name: { type: "string", description: "Display name" },
         email: { type: "string", description: "Email address (unique)" },
         groups: { type: "array", items: { type: "string" }, description: "Group names" },
         is_admin: { type: "boolean" },
+        send_email: { type: "boolean", description: "Email the invite to them" },
       },
       ["name", "email"],
     ),
@@ -108,7 +111,16 @@ export const PEOPLE_TOOLS: ToolDef[] = [
         },
         actor,
       );
-      return { id: r.id, enrollment_link: r.enrollmentLink };
+      const delivery =
+        args.send_email === true
+          ? await deliverLink(
+              env,
+              { name: str(args.name), email: str(args.email), public: 0 },
+              r.enrollmentLink,
+              "invite",
+            )
+          : null;
+      return { id: r.id, enrollment_link: r.enrollmentLink, emailed: delivery?.emailed ?? false };
     },
   },
   {
@@ -170,10 +182,16 @@ export const PEOPLE_TOOLS: ToolDef[] = [
     name: "users_make_member",
     write: true,
     description:
-      "Turn a public (self-registered) account into a member: it can then sign in to members-only apps and is covered by everyone grants, subject to its groups and grants.",
-    inputSchema: obj(USER_REF),
+      "Turn a public (self-registered) account into a member: it can then sign in to members-only apps and is covered by everyone grants, subject to its groups and grants. Requires the person's real email, which apps will see as verified.",
+    inputSchema: obj(
+      {
+        user_id: { type: "string", description: "User id" },
+        email: { type: "string", description: "The person's real email address" },
+      },
+      ["user_id", "email"],
+    ),
     handler: async ({ db, actor }, args) => {
-      await ops.makeMember(db, (await userByRef(db, args)).id, actor);
+      await ops.makeMember(db, str(args.user_id), str(args.email), actor);
       return { ok: true };
     },
   },
@@ -181,11 +199,59 @@ export const PEOPLE_TOOLS: ToolDef[] = [
     name: "users_enrollment_link",
     write: true,
     description:
-      "Mint a new one-time passkey enrollment link for a user (first setup or recovery).",
-    inputSchema: obj(USER_REF),
+      "Mint a new one-time passkey enrollment link for a user (first setup or recovery). Older unused links for them stop working. `send_email` emails it to them.",
+    inputSchema: obj({ ...USER_REF, send_email: { type: "boolean" } }),
     handler: async ({ db, env, actor }, args) => {
       const u = await userByRef(db, args);
-      return { enrollment_link: await ops.mintEnrollmentLink(db, env.ISSUER, u.id, actor) };
+      const link = await ops.mintEnrollmentLink(db, env.ISSUER, u.id, actor);
+      const delivery = args.send_email === true ? await deliverLink(env, u, link, "relink") : null;
+      return { enrollment_link: link, emailed: delivery?.emailed ?? false };
+    },
+  },
+  {
+    name: "invites_list",
+    write: false,
+    description: "People with an unused enrollment link: when it was sent and when it expires.",
+    inputSchema: obj(),
+    handler: async ({ db }) => pendingInvites(db),
+  },
+  {
+    name: "invites_revoke",
+    write: true,
+    description: "Revoke a person's unused enrollment links. Their account stays.",
+    inputSchema: obj(USER_REF),
+    handler: async ({ db, actor }, args) => ({
+      revoked: await revokeInvites(db, (await userByRef(db, args)).id, actor),
+    }),
+  },
+  {
+    name: "recovery_requests_list",
+    write: false,
+    description:
+      "People who asked for help signing in after losing their passkeys (Settings › Sign-in › Lost passkeys).",
+    inputSchema: obj(),
+    handler: async ({ db }) => pendingRecovery(db),
+  },
+  {
+    name: "recovery_requests_resolve",
+    write: true,
+    description:
+      "Approve (mint a one-hour passkey link, optionally emailed) or dismiss a sign-in help request. Verify the request really came from the person before approving.",
+    inputSchema: obj(
+      {
+        id: { type: "string", description: "Request id from recovery_requests_list" },
+        action: { type: "string", enum: ["approve", "dismiss"] },
+        send_email: { type: "boolean" },
+      },
+      ["id", "action"],
+    ),
+    handler: async ({ db, env, actor }, args) => {
+      if (str(args.action) === "dismiss") {
+        await dismissRecovery(db, str(args.id), actor);
+        return { ok: true };
+      }
+      const r = await approveRecovery(env, str(args.id), args.send_email === true, actor);
+      return { enrollment_link: r.link, emailed: r.delivery?.emailed ?? false };
     },
   },
   {

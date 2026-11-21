@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import { restoreDrill } from "./restore-drill.mjs";
 import { chromium } from "playwright";
 import { startLocal, startRemote } from "./instances.mjs";
 import { createRemoteJWKSet, jwtVerify, decodeJwt } from "jose";
@@ -94,6 +96,44 @@ async function authorizeInBrowser(params, { approve } = {}) {
   return captured;
 }
 
+async function settledGoto(p, url) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await p.goto(url);
+    } catch (e) {
+      if (!String(e).includes("interrupted by another navigation")) throw e;
+      await p.waitForLoadState("load").catch(() => {});
+    }
+  }
+  return p.goto(url);
+}
+
+async function waitForMail(match, skip = 0) {
+  for (let i = 0; i < 40; i++) {
+    const mail = instance
+      .outbox?.()
+      .slice(skip)
+      .find((m) => match(m) && m.text);
+    if (mail) return mail;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return instance.outbox?.().slice(skip).find(match) ?? null;
+}
+
+async function stepUp(next) {
+  await settledGoto(page, `${BASE}/login?reauth=1&next=${encodeURIComponent(next)}`);
+  const arrived = (u) => u.pathname === next.split(/[?#]/)[0];
+  for (let i = 0; i < 3; i++) {
+    await page.click("#passkey-btn", { timeout: 3000 }).catch(() => {});
+    const ok = await page
+      .waitForURL(arrived, { timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    if (ok) return;
+  }
+  await page.waitForURL(arrived, { timeout: 5000 });
+}
+
 async function mcpCall(token, method, params = {}, headers = {}) {
   const r = await fetch(MCP, {
     method: "POST",
@@ -109,7 +149,7 @@ async function mcpCall(token, method, params = {}, headers = {}) {
 
 try {
   step("enroll + sign in with a passkey");
-  await page.goto(`${BASE}/enroll/${adminToken}`);
+  await page.goto(`${BASE}/enroll#${adminToken}`);
   await page.fill("#key-name", "E2E key");
   await page.click("#enroll-btn");
   await page.waitForURL(`${BASE}/?**`, { timeout: 15000 }).catch(() => {});
@@ -120,8 +160,14 @@ try {
     "authenticator holds one resident credential",
     creds.credentials.length === 1 && creds.credentials[0].isResidentCredential,
   );
-  const reuse = await page.request.get(`${BASE}/enroll/${adminToken}`);
-  check("enrollment link is single-use", reuse.status() === 400);
+  const reuse = await fetch(`${BASE}/webauthn/register/options`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enrollmentToken: adminToken }),
+  });
+  check("enrollment link is single-use", reuse.status === 400);
+  const legacy = await fetch(`${BASE}/enroll/${adminToken}`);
+  check("path-style enrollment links are gone", legacy.status === 404);
 
   await page.click("form[action='/logout'] button");
   await page.waitForURL(/\/login/);
@@ -138,6 +184,13 @@ try {
   );
 
   step("credential changes require a fresh passkey recheck");
+  await page.goto(BASE + "/account");
+  await page.click("[data-check-key]");
+  await page.getByText(/^Tested /).waitFor();
+  check(
+    "testing a named passkey keeps the current session",
+    (await ctx.cookies(BASE)).find((c) => c.name === "__Host-idp_session")?.value === sess.value,
+  );
   const beforeStepUp = await page.request.post(`${BASE}/webauthn/register/options`, { data: {} });
   check(
     "fresh login session alone cannot add a passkey",
@@ -162,6 +215,12 @@ try {
     "/admin/tokens",
     "/admin/metrics",
     "/admin/settings",
+    "/admin/settings/sign-in",
+    "/admin/settings/email",
+    "/admin/settings/clients",
+    "/admin/settings/keys",
+    "/admin/settings/cloudflare",
+    "/admin/settings/about",
     "/account",
   ]) {
     const r = await page.goto(BASE + p);
@@ -186,6 +245,12 @@ try {
 
   step("app groups, grants and the launcher");
   await page.goto(`${BASE}/admin/apps`);
+  check(
+    "catalog omits inactive app and group editors",
+    (await page
+      .locator("dialog[id^='edit-'],dialog[id^='access-'],#new-app,#new-app-group")
+      .count()) === 0,
+  );
   await page.click("[data-open='new-app-group']");
   await page.fill("#new-app-group input[name=name]", "Home");
   await page.click("#new-app-group button[type=submit]");
@@ -233,6 +298,31 @@ try {
     await page.isVisible(
       ".launcher-section:has(h3:has-text('Favorites')) .tile:has-text('Solar Panel')",
     ),
+  );
+
+  await sql(
+    Array.from(
+      { length: 6 },
+      (_, i) =>
+        `INSERT INTO apps (id, name, url, created_at) VALUES ('search-${i}', 'Library ${i}', 'https://library.example.test', ${now});
+       INSERT INTO app_grants (id, app_id, user_id, created_at) VALUES ('search-${i}', 'search-${i}', 'admin-1', ${now});`,
+    ).join("\n"),
+  );
+  await page.reload();
+  const search = page.getByRole("searchbox", { name: "Find an app" });
+  await search.fill("LIBRARY");
+  check(
+    "launcher search filters tiles and hides empty sections",
+    (await page.locator("#launcher [data-filter-text]:visible").count()) === 6 &&
+      (await page.locator("#launcher [data-filter-section]:visible").count()) === 1,
+  );
+  await search.fill("");
+  check(
+    "clearing search restores groups and favorites",
+    (await page.locator("#launcher [data-filter-section]:visible").count()) === 3,
+  );
+  await sql(
+    "DELETE FROM apps WHERE id IN ('search-0','search-1','search-2','search-3','search-4','search-5')",
   );
 
   await page.goto(`${BASE}/admin/users`);
@@ -402,6 +492,7 @@ try {
   }
 
   step("MCP via dynamic client registration (Cursor/Claude Code style)");
+  await stepUp("/admin");
   const reg = await fetch(`${BASE}/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -433,15 +524,18 @@ try {
     code_challenge: p2.challenge,
     code_challenge_method: "S256",
   };
-  await page.goto(`${BASE}/authorize?${new URLSearchParams(mcpAuth)}`);
+  const consentPage = await page.context().newPage();
+  await consentPage.goto(`${BASE}/authorize?${new URLSearchParams(mcpAuth)}`);
+  await consentPage.locator("form[action='/authorize/decision']").waitFor();
   check(
     "third-party client gets a consent screen",
-    !!(await page.$("form[action='/authorize/decision']")),
+    await consentPage.locator("form[action='/authorize/decision']").isVisible(),
   );
   check(
     "consent warns about a local redirect",
-    (await page.textContent("body")).includes("runs on your computer"),
+    (await consentPage.textContent("body")).includes("runs on your computer"),
   );
+  await consentPage.close();
   const denied = await authorizeInBrowser(mcpAuth, { approve: false });
   check(
     "deny → access_denied",
@@ -593,12 +687,30 @@ try {
     const r = await mcpCall(mt.access_token, "tools/call", { name, arguments: args });
     return JSON.parse(r.body?.result?.content?.[0]?.text ?? "null");
   };
-  const conn = await tool("apps_connect", {
+  const connection = {
     template: "grafana",
     base_url: "https://grafana.example.test/",
     name: "Grafana",
     groups: ["family"],
-  });
+  };
+  const planned = await tool("apps_connect", { ...connection, preview: true });
+  check(
+    "connection preview leaves the catalog untouched",
+    planned?.status === "preview" &&
+      !(await sql("SELECT id FROM apps WHERE name='Grafana'")).length,
+  );
+  const connections = await Promise.all([
+    tool("apps_connect", connection),
+    tool("apps_connect", connection),
+  ]);
+  const conn = connections.find((x) => x?.status === "created");
+  check(
+    "simultaneous connections share one client and one pickup",
+    connections.some(
+      (x) =>
+        x?.status === "connected" && x.client_id === conn?.client_id && x.secret_pickup === null,
+    ),
+  );
   const grafanaRedirect = "https://grafana.example.test/login/generic_oauth";
   check(
     "apps_connect registers the template's redirect URI and returns a pickup",
@@ -619,6 +731,24 @@ try {
     !JSON.stringify(conn).includes(grafanaSecret),
   );
   await tool("grants_add", { app: conn?.app?.slug, group: "family", role: "writer" });
+  const retry = await tool("apps_connect", connection);
+  check(
+    "retry preserves the installed credential",
+    retry?.client_id === conn?.client_id && retry?.secret_pickup === null,
+  );
+  const why = await tool("access_explain", { user_id: "admin-1", app: conn.app.id });
+  check(
+    "inspector uses the linked client's actual roles",
+    why.visible && why.roles.includes("writer") && why.sign_in === "Eligible",
+  );
+  await page.goto(BASE + "/admin/users/admin-1?tab=access&app=" + conn.app.id);
+  check(
+    "people view explains the same grant",
+    await page
+      .getByLabel("Access explanation")
+      .innerText()
+      .then((s) => s.includes("writer") && s.includes("family")),
+  );
   const p4 = pkce();
   const grafanaAuth = {
     client_id: conn?.client_id,
@@ -659,6 +789,13 @@ try {
     String(refused?.status()),
   );
 
+  const inspectionDenied = await tool("access_explain", { user_id: "admin-1", app: conn.app.id });
+  check(
+    "inspector explains the denied sign-in and hidden tile",
+    !inspectionDenied.visible &&
+      inspectionDenied.sign_in === "app access was removed" &&
+      !inspectionDenied.roles.length,
+  );
   step("public sign-up: open app, contained account");
   const game = await tool("clients_create", {
     name: "Game",
@@ -693,15 +830,6 @@ try {
     code_challenge: p5.challenge,
     code_challenge_method: "S256",
   };
-  const codeFor = (origin) => {
-    let code = null;
-    gpage.on("request", (r) => {
-      const u = new URL(r.url());
-      if (u.origin === origin && u.searchParams.get("code")) code = u.searchParams.get("code");
-    });
-    return () => code;
-  };
-  const gameCode = codeFor("https://game.example.test");
   await gpage.goto(`${BASE}/authorize?${new URLSearchParams(gameAuth)}`);
   check(
     "sign-in for a public app offers Create an account",
@@ -709,17 +837,17 @@ try {
   );
   await gpage.click("a:has-text('Create an account')");
   await gpage.fill("#signup-name", "Pat Player");
+  const gameCallback = gpage.waitForRequest(
+    (r) => new URL(r.url()).origin === "https://game.example.test",
+  );
   await gpage.click("#signup-btn");
-  for (let i = 0; i < 80 && !gameCode(); i++) await gpage.waitForTimeout(100);
-  check("sign-up lands back in the app with a code", !!gameCode());
-  await gpage
-    .waitForURL((u) => u.href.startsWith("chrome-error:"), { timeout: 5000 })
-    .catch(() => {});
+  const gameCode = new URL((await gameCallback).url()).searchParams.get("code");
+  check("sign-up lands back in the app with a code", !!gameCode);
   const pt = await (
     await tokenReq(
       {
         grant_type: "authorization_code",
-        code: gameCode(),
+        code: gameCode,
         redirect_uri: "https://game.example.test/cb",
         code_verifier: p5.verifier,
       },
@@ -745,10 +873,11 @@ try {
     code_challenge: p5.challenge,
     code_challenge_method: "S256",
   });
-  const refusedPub = await gpage.goto(`${BASE}/authorize?${membersAuth}`);
+  const memberPage = await gctx.newPage();
+  const refusedPub = await memberPage.goto(`${BASE}/authorize?${membersAuth}`);
   check(
     "a public account is refused at a members-only app",
-    refusedPub?.status() === 403 && (await gpage.textContent("body")).includes("members only"),
+    refusedPub?.status() === 403 && (await memberPage.textContent("body")).includes("members only"),
     String(refusedPub?.status()),
   );
   const closedSignup = await fetch(`${BASE}/webauthn/signup/options`, {
@@ -764,11 +893,17 @@ try {
     arguments: { user_id: pub?.id, is_admin: true },
   });
   check("a public account can't be made admin", promote.body?.result?.isError === true);
-  await tool("users_make_member", { user_id: pub?.id });
-  const membersCode = codeFor("https://members.example.test");
-  await gpage.goto(`${BASE}/authorize?${membersAuth}`).catch(() => {});
-  for (let i = 0; i < 50 && !membersCode(); i++) await gpage.waitForTimeout(100);
-  check("after Make member the same account is admitted", !!membersCode());
+  await tool("users_make_member", { user_id: pub?.id, email: "pat@example.test" });
+  const promoted = await memberPage.request.get(`${BASE}/authorize?${membersAuth}`, {
+    maxRedirects: 0,
+  });
+  const memberCallback = new URL(promoted.headers().location);
+  check(
+    "after Make member the same account is admitted",
+    promoted.status() === 302 &&
+      memberCallback.origin === "https://members.example.test" &&
+      !!memberCallback.searchParams.get("code"),
+  );
   await gctx.close();
 
   await sql(
@@ -879,7 +1014,20 @@ try {
 
   step("API tokens");
   {
+    await sql("UPDATE sessions SET step_up_at = step_up_at - 3600 WHERE step_up_at IS NOT NULL");
     await page.goto(`${BASE}/admin/tokens`);
+    await page.click("button[data-open='new-token']");
+    await page.fill("#new-token input[name=name]", "read bot");
+    await page.click("#new-token button[type=submit]");
+    await page.waitForURL(/\/login\?reauth=1/, { timeout: 15000 }).catch(() => {});
+    check(
+      "a sensitive admin action without a recent recheck asks for the passkey",
+      page.url().includes("reauth=1") && page.url().includes(encodeURIComponent("/admin/tokens")),
+      page.url(),
+    );
+    await page.click("#passkey-btn", { timeout: 3000 }).catch(() => {});
+    await page.waitForURL(`${BASE}/admin/tokens`, { timeout: 15000 }).catch(() => {});
+    check("…and comes back to the page", new URL(page.url()).pathname === "/admin/tokens");
     await page.click("button[data-open='new-token']");
     await page.fill("#new-token input[name=name]", "read bot");
     await page.click("#new-token button[type=submit]");
@@ -954,6 +1102,7 @@ try {
   }
 
   step("instance settings");
+  await stepUp("/admin/settings");
   {
     const setting = async (key) =>
       (await sql(`SELECT value FROM instance_settings WHERE key = '${key}'`))[0]?.value ?? null;
@@ -978,6 +1127,7 @@ try {
     await page.fill("input[name=name]", "E2E Identity");
     await saveSettings();
 
+    await page.goto(`${BASE}/admin/settings/cloudflare`);
     check(
       "Cloudflare card offers to connect",
       !!(await page.$("#cloudflare form[action='/admin/settings/cloudflare']")),
@@ -995,7 +1145,7 @@ try {
     await sql(
       "INSERT INTO instance_settings (key, value, updated_at) VALUES ('cf_api_token', 'seeded-token-value-0123456789', 0), ('cf_account_id', 'fedcba9876543210fedcba9876543210', 0)",
     );
-    await page.goto(`${BASE}/admin/settings`);
+    await page.goto(`${BASE}/admin/settings/cloudflare`);
     const card = (await page.textContent("#cloudflare")) ?? "";
     check(
       "a saved connection shows as connected, never the token",
@@ -1003,6 +1153,12 @@ try {
         !card.includes("seeded-token-value") &&
         !(await page.content()).includes("seeded-token-value"),
     );
+    await page.request.post(`${BASE}/admin/settings/cloudflare/revoke`, { form: { on: "1" } });
+    check(
+      "Access revocation is refused with a token saved in settings",
+      (await setting("cf_access_revoke")) === null,
+    );
+    await page.goto(`${BASE}/admin/settings/cloudflare`);
     await page.click("form[action='/admin/settings/cloudflare/remove'] button");
     await page.waitForSelector("#confirm-dialog[open]");
     await Promise.all([page.waitForNavigation(), page.click("#confirm-ok")]);
@@ -1010,6 +1166,478 @@ try {
       "disconnect clears the stored credentials",
       (await setting("cf_api_token")) === null && (await setting("cf_account_id")) === null,
     );
+  }
+
+  step("email");
+  if (!instance.remote) {
+    await stepUp("/admin/settings/email");
+    check(
+      "with a binding but no sender, email asks for one",
+      (await page.textContent(".settings-nav")).includes("Not set up") ||
+        (await page.textContent("body")).includes("Needs a sender"),
+    );
+    await page.fill("input[name=from]", "id@example.test");
+    await page.check("input[name=enabled]", { force: true });
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action='/admin/settings/email'] button[type=submit]"),
+    ]);
+    check("email shows as sending", (await page.textContent(".settings-nav")).includes("On"));
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action='/admin/settings/email/test'] button[type=submit]"),
+    ]);
+    const flash = await page.getAttribute("body", "data-flash");
+    const test = await waitForMail((m) => m.subject.startsWith("Test email from"));
+    check(
+      "a test email goes to the admin, from the configured sender",
+      test?.to.includes("ada@example.test") &&
+        test?.from.includes("id@example.test") &&
+        test?.text.includes("Email works"),
+      { test, flash },
+    );
+  }
+
+  step("invites by email");
+  if (!instance.remote) {
+    const tokenIn = (mail) => mail?.text.match(/\/enroll#([A-Za-z0-9_-]{43})/)?.[1] ?? null;
+    const linkWorks = async (t) =>
+      (
+        await fetch(`${BASE}/webauthn/register/options`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enrollmentToken: t }),
+        })
+      ).status === 200;
+    await stepUp("/admin/users");
+    await page.click("[data-open='invite']");
+    await page.fill("#invite input[name=name]", "Mailed Person");
+    await page.fill("#invite input[name=email]", "mailed@example.test");
+    check(
+      "the invite dialog offers to email it",
+      await page.isChecked("#invite input[name=sendEmail]"),
+    );
+    await Promise.all([page.waitForNavigation(), page.click("#invite button[type=submit]")]);
+    check(
+      "the reveal page says it was emailed",
+      (await page.textContent("body")).includes("Emailed to"),
+    );
+    const first = tokenIn(await waitForMail((m) => m.to.includes("mailed@example.test")));
+    check("the invite email carries a working link", !!first && (await linkWorks(first)));
+    await page.goto(`${BASE}/admin/users/invites`);
+    check(
+      "pending invites lists the person",
+      (await page.textContent("body")).includes("mailed@example.test"),
+    );
+    const before = instance.outbox().length;
+    await Promise.all([page.waitForNavigation(), page.click("form[action$='/resend'] button")]);
+    const resent = await waitForMail((m) => m.to.includes("mailed@example.test"), before);
+    const second = tokenIn(resent);
+    check(
+      "resending emails a new link and retires the old one",
+      !!second && second !== first && (await linkWorks(second)) && !(await linkWorks(first)),
+    );
+    await page.goto(`${BASE}/admin/users/invites`);
+    await page.click("form[action$='/revoke'] button");
+    await page.waitForSelector("#confirm-dialog[open]");
+    await Promise.all([page.waitForNavigation(), page.click("#confirm-ok")]);
+    check("revoking kills the link", !(await linkWorks(second)));
+    await page.click("[data-open='bulk-invite']");
+    await page.fill(
+      "#bulk-invite textarea[name=people]",
+      "Bulk One <bulk1@example.test>\nbulk2@example.test, Bulk Two\nno address here",
+    );
+    await Promise.all([page.waitForNavigation(), page.click("#bulk-invite button[type=submit]")]);
+    const bulkPage = (await page.textContent("body")) ?? "";
+    check(
+      "bulk invite creates and emails each person and reports the bad line",
+      bulkPage.includes("2 invited") &&
+        bulkPage.includes("No email address") &&
+        !!(await waitForMail((m) => m.to.includes("bulk2@example.test"))),
+      bulkPage.slice(0, 300),
+    );
+  }
+
+  step("self-service email change");
+  if (!instance.remote) {
+    await page.goto(`${BASE}/admin/settings/email`);
+    await page.check("input[name=selfEmailChange]", { force: true });
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action='/admin/settings/email/people'] button[type=submit]"),
+    ]);
+    await stepUp("/account");
+    await page.fill(".email-change input[name=email]", "ada.new@example.test");
+    await Promise.all([page.waitForNavigation(), page.click(".email-change button[type=submit]")]);
+    const confirm = await waitForMail((m) => m.to.includes("ada.new@example.test"));
+    const link = confirm?.text.match(/(http\S+\/account\/email\/confirm#[A-Za-z0-9_-]{43})/)?.[1];
+    check("the new address gets a confirmation link", !!link, confirm);
+    const stillOld = (await sql("SELECT email FROM users WHERE id = 'admin-1'"))[0]?.email;
+    check("nothing changes until it's opened", stillOld === "ada@example.test", stillOld);
+    await page.goto(link ?? `${BASE}/`);
+    await Promise.all([page.waitForNavigation(), page.click("form[data-fragment-token] button")]);
+    const now = (await sql("SELECT email FROM users WHERE id = 'admin-1'"))[0]?.email;
+    check("confirming switches the email", now === "ada.new@example.test", now);
+    check(
+      "the old address is told",
+      !!(await waitForMail(
+        (m) => m.to.includes("ada@example.test") && m.subject.includes("email was changed"),
+      )),
+    );
+    await page.goto("about:blank");
+    await page.goto(link ?? `${BASE}/`);
+    await Promise.all([page.waitForNavigation(), page.click("form[data-fragment-token] button")]);
+    check("the link works once", (await page.textContent("h1"))?.includes("Couldn't"));
+    await sql("UPDATE users SET email = 'ada@example.test' WHERE id = 'admin-1'");
+  }
+
+  step("sign-in help, alerts and webhooks");
+  if (!instance.remote) {
+    const received = [];
+    const hookServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        received.push({ headers: req.headers, body });
+        res.end("ok");
+      });
+    });
+    await new Promise((r) => hookServer.listen(0, "127.0.0.1", r));
+    const hookUrl = `http://localhost:${hookServer.address().port}/hook`;
+    const hookEvent = async (event) => {
+      for (let i = 0; i < 40; i++) {
+        const hit = received.find((r) => r.body.includes(`"event":"${event}"`));
+        if (hit) return hit;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return null;
+    };
+    await stepUp("/admin/settings/notifications");
+    await page.fill("form[action$='/webhooks'] input[name=name]", "Receiver");
+    await page.fill("form[action$='/webhooks'] input[name=url]", hookUrl);
+    await page.check("form[action$='/webhooks'] input[name=sign]");
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/webhooks'] button[type=submit]"),
+    ]);
+    await Promise.all([page.waitForNavigation(), page.click("form[action$='/test'] button")]);
+    const test = await hookEvent("WEBHOOK_TEST");
+    const secret = (await sql("SELECT secret FROM webhooks"))[0]?.secret;
+    check(
+      "a webhook test arrives, signed with the webhook's secret",
+      !!test &&
+        !!secret &&
+        test.headers["x-edge-idp-signature"] ===
+          `sha256=${createHmac("sha256", secret).update(test.body).digest("hex")}`,
+    );
+    await page.check("form[action$='/alerts'] input[name=emailAdmins]", { force: true });
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/alerts'] button[type=submit]"),
+    ]);
+    await page.goto(`${BASE}/admin/settings/sign-in`);
+    await page.check("input[name=recoveryMode][value=approval]");
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/recovery'] button[type=submit]"),
+    ]);
+    await sql(
+      `INSERT INTO users (id, created_at, name, email, is_admin, updated_at) VALUES ('rec-1', ${now}, 'Rita Recover', 'rita@example.test', 0, ${now})`,
+    );
+    const anon = await browser.newContext();
+    const ap = await anon.newPage();
+    await ap.goto(`${BASE}/login`);
+    check("sign-in offers help when recovery is on", await ap.isVisible("a[href='/recover']"));
+    const ask = async (email) => {
+      await ap.goto(`${BASE}/recover`);
+      await ap.fill("input[name=email]", email);
+      await Promise.all([ap.waitForNavigation(), ap.click("button[type=submit]")]);
+      return (await ap.textContent("h1")) ?? "";
+    };
+    const unknown = await ask("nobody@example.test");
+    const known = await ask("rita@example.test");
+    check("the answer is the same for unknown and known addresses", unknown === known, {
+      unknown,
+      known,
+    });
+    const pending = await sql("SELECT status FROM recovery_requests WHERE user_id = 'rec-1'");
+    check("approval mode records a request", pending[0]?.status === "pending", pending);
+    check("…alerts the webhook", !!(await hookEvent("RECOVERY_REQUESTED")));
+    check(
+      "…and emails admins",
+      !!(await waitForMail(
+        (m) => m.to.includes("ada@example.test") && m.subject.includes("Asked for help"),
+      )),
+    );
+    await page.goto(`${BASE}/admin`);
+    check(
+      "the overview says someone needs help",
+      (await page.textContent("body")).includes("needs help signing in"),
+    );
+    await page.goto(`${BASE}/admin/users/recovery`);
+    await page.click("form[action$='/approve'] button");
+    await page.waitForSelector("#confirm-dialog[open]");
+    await Promise.all([page.waitForNavigation(), page.click("#confirm-ok")]);
+    const recMail = await waitForMail(
+      (m) => m.to.includes("rita@example.test") && m.subject.includes("Add a passkey"),
+    );
+    const recToken = recMail?.text.match(/\/enroll#([A-Za-z0-9_-]{43})/)?.[1];
+    const recOk = recToken
+      ? (
+          await fetch(`${BASE}/webauthn/register/options`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ enrollmentToken: recToken }),
+          })
+        ).status === 200
+      : false;
+    check("approving emails a working one-hour link", recOk, recMail);
+    await page.goto(`${BASE}/admin/settings/sign-in`);
+    await page.check("input[name=recoveryMode][value=auto]");
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/recovery'] button[type=submit]"),
+    ]);
+    const before = instance.outbox().length;
+    await ask("rita@example.test");
+    check(
+      "automatic mode emails a member directly",
+      !!(await waitForMail((m) => m.to.includes("rita@example.test"), before)),
+    );
+    await ask("ada@example.test");
+    const adminAsk = await sql(
+      "SELECT status FROM recovery_requests WHERE user_id = 'admin-1' AND status = 'pending'",
+    );
+    check("…but an admin's request still waits for another admin", adminAsk.length === 1);
+    await sql("DELETE FROM recovery_requests");
+    await anon.close();
+    await tool("users_set_admin", { user_id: "rec-1", is_admin: true });
+    check(
+      "the person is told when they become an admin",
+      !!(await waitForMail(
+        (m) => m.to.includes("rita@example.test") && m.subject.includes("now an admin"),
+      )),
+    );
+    await tool("users_set_admin", { user_id: "rec-1", is_admin: false });
+    await page.goto(`${BASE}/admin/settings/sign-in`);
+    await page.check("input[name=recoveryMode][value=off]");
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/recovery'] button[type=submit]"),
+    ]);
+    hookServer.close();
+  }
+
+  step("email sign-in links and per-app policy");
+  if (!instance.remote) {
+    await stepUp("/admin/settings/sign-in");
+    await page.check("input[name=magicLinks]", { force: true });
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/email-links'] button[type=submit]"),
+    ]);
+    const mailed = (await sql("SELECT id FROM users WHERE email = 'mailed@example.test'"))[0]?.id;
+    await sql(
+      `INSERT OR IGNORE INTO group_members (group_id, user_id, created_at) SELECT id, '${mailed}', 0 FROM groups WHERE name = 'family'`,
+    );
+    const mctx = await browser.newContext();
+    const mp = await mctx.newPage();
+    const askLink = async (email) => {
+      await mp.goto(`${BASE}/login`);
+      await mp.click("summary:has-text('Email me a sign-in link')");
+      await mp.fill("form[action='/login/email'] input[name=email]", email);
+      await Promise.all([
+        mp.waitForNavigation(),
+        mp.click("form[action='/login/email'] button[type=submit]"),
+      ]);
+    };
+    const before = instance.outbox().length;
+    await askLink("ada@example.test");
+    await askLink("mailed@example.test");
+    const linkMail = await waitForMail((m) => m.subject.startsWith("Sign in to"), before);
+    check(
+      "only the member gets a link, never an admin",
+      linkMail?.to.includes("mailed@example.test") &&
+        !instance
+          .outbox()
+          .slice(before)
+          .some((m) => m.to.includes("ada@example.test") && m.subject.startsWith("Sign in to")),
+      linkMail,
+    );
+    const link = linkMail?.text.match(/(http\S+\/login\/link#[A-Za-z0-9_-]{43})/)?.[1];
+    await mp.goto(link ?? `${BASE}/`);
+    await Promise.all([mp.waitForNavigation(), mp.click("form[data-fragment-token] button")]);
+    check(
+      "the link shows whose account it signs in to",
+      (await mp.textContent("h1"))?.includes("Mailed Person"),
+    );
+    await Promise.all([mp.waitForNavigation(), mp.click("button[type=submit]")]);
+    const method = (await sql(`SELECT method FROM sessions WHERE user_id = '${mailed}'`))[0]
+      ?.method;
+    check("signing in makes an email-method session", method === "email", method);
+    check(
+      "the person is told about the email sign-in",
+      !!(await waitForMail(
+        (m) => m.to.includes("mailed@example.test") && m.subject.includes("email link"),
+      )),
+    );
+    const p6 = pkce();
+    let captured = null;
+    mp.on("request", (r) => {
+      const u = new URL(r.url());
+      if (u.origin === "https://app.example.test") captured = u;
+    });
+    const authz = (extra = {}) =>
+      `${BASE}/authorize?${new URLSearchParams({
+        client_id: CLIENT_ID,
+        redirect_uri: "https://app.example.test/callback",
+        response_type: "code",
+        scope: "openid",
+        code_challenge: p6.challenge,
+        code_challenge_method: "S256",
+        ...extra,
+      })}`;
+    await mp.goto(authz()).catch(() => {});
+    for (let i = 0; i < 50 && !captured; i++) await mp.waitForTimeout(100);
+    const otp = await (
+      await tokenReq({
+        grant_type: "authorization_code",
+        code: captured?.searchParams.get("code") ?? "",
+        redirect_uri: "https://app.example.test/callback",
+        code_verifier: p6.verifier,
+      })
+    ).json();
+    check(
+      "apps see an email sign-in as amr otp",
+      JSON.stringify(otp.id_token ? decodeJwt(otp.id_token).amr : null) === '["otp"]',
+      otp,
+    );
+    await tool("clients_sign_in_policy", { client_id: CLIENT_ID, require_passkey: true });
+    captured = null;
+    await settledGoto(mp, "about:blank");
+    await settledGoto(mp, authz()).catch(() => {});
+    check(
+      "an app that requires a passkey sends an email sign-in back to sign in",
+      new URL(mp.url()).pathname === "/login" && mp.url().includes("reauth=1") && !captured,
+      mp.url(),
+    );
+    await tool("clients_sign_in_policy", { client_id: CLIENT_ID, require_passkey: false });
+    await settledGoto(mp, "about:blank");
+    await settledGoto(mp, link ?? `${BASE}/`);
+    await Promise.all([mp.waitForNavigation(), mp.click("form[data-fragment-token] button")]);
+    check("a sign-in link works once", (await mp.textContent("h1"))?.includes("expired"));
+    await mctx.close();
+    await page.goto(`${BASE}/admin/settings/sign-in`);
+    await page.uncheck("input[name=magicLinks]", { force: true });
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click("form[action$='/email-links'] button[type=submit]"),
+    ]);
+  }
+
+  step("back-channel logout");
+  if (!instance.remote) {
+    const posts = [];
+    const bc = createServer((req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        posts.push({ type: req.headers["content-type"], body });
+        res.end("ok");
+      });
+    });
+    await new Promise((r) => bc.listen(0, "127.0.0.1", r));
+    const disc = await (await fetch(`${BASE}/.well-known/openid-configuration`)).json();
+    check(
+      "discovery advertises back-channel logout",
+      disc.backchannel_logout_supported === true &&
+        disc.backchannel_logout_session_supported === false,
+    );
+    await tool("clients_sign_in_policy", {
+      client_id: CLIENT_ID,
+      backchannel_logout_uri: `http://localhost:${bc.address().port}/bc`,
+    });
+    const mailed = (await sql("SELECT id FROM users WHERE email = 'mailed@example.test'"))[0]?.id;
+    const signedIn = (
+      await sql(`SELECT COUNT(*) AS n FROM client_signins WHERE user_id = '${mailed}'`)
+    )[0]?.n;
+    check("a code redemption records the app sign-in", signedIn >= 1, signedIn);
+    await tool("users_sign_out", { user_id: mailed });
+    for (let i = 0; i < 40 && !posts.length; i++) await new Promise((r) => setTimeout(r, 100));
+    const lt = new URLSearchParams(posts[0]?.body ?? "").get("logout_token");
+    let claims = null;
+    let header = null;
+    if (lt) {
+      const v = await jwtVerify(lt, JWKS, { issuer: BASE, audience: CLIENT_ID });
+      claims = v.payload;
+      header = v.protectedHeader;
+    }
+    check(
+      "signing someone out everywhere posts a verified logout token to the app",
+      posts[0]?.type?.startsWith("application/x-www-form-urlencoded") &&
+        header?.typ === "logout+jwt" &&
+        claims?.sub === mailed &&
+        !!claims?.events?.["http://schemas.openid.net/event/backchannel-logout"] &&
+        claims?.nonce === undefined,
+      { header, claims },
+    );
+    const left = (
+      await sql(`SELECT COUNT(*) AS n FROM client_signins WHERE user_id = '${mailed}'`)
+    )[0]?.n;
+    check("…and forgets the app sign-ins", left === 0, left);
+    await tool("clients_sign_in_policy", { client_id: CLIENT_ID, backchannel_logout_uri: "" });
+    bc.close();
+  }
+
+  step("backup and restore");
+  if (!instance.remote) {
+    await stepUp("/admin/settings/backup");
+    await sql(
+      `INSERT INTO groups (id, name, description, created_at) VALUES ('g-restore', 'restore-me', 'from backup', ${now})`,
+    );
+    await tool("grants_add", { app: conn.app.id, user_id: "admin-1", role: "reader" });
+    const res = await page.request.post(`${BASE}/admin/settings/backup/export`);
+    const backup = await res.json();
+    check(
+      "the backup has people, passkeys and groups, but no sessions or Cloudflare token",
+      backup.format === "edge-idp-backup" &&
+        backup.tables.users.some((u) => u.id === "admin-1") &&
+        backup.tables.groups.some((g) => g.name === "restore-me") &&
+        typeof backup.tables.webauthn_credentials[0]?.public_key?.$b64 === "string" &&
+        !("sessions" in backup.tables) &&
+        !backup.tables.instance_settings.some((r) => r.key === "cf_api_token"),
+    );
+    await sql("DELETE FROM groups WHERE id = 'g-restore'");
+    const preview = await page.request.post(BASE + "/admin/settings/backup/preview", {
+      multipart: {
+        file: {
+          name: "backup.json",
+          mimeType: "application/json",
+          buffer: Buffer.from(JSON.stringify(backup)),
+        },
+      },
+    });
+    check(
+      "restore preview predicts changes without writing",
+      (await preview.text()).includes("Restore preview") &&
+        !(await sql("SELECT id FROM groups WHERE id='g-restore'")).length,
+    );
+    const restored = await page.request.post(`${BASE}/admin/settings/backup/import`, {
+      multipart: {
+        file: {
+          name: "backup.json",
+          mimeType: "application/json",
+          buffer: Buffer.from(JSON.stringify(backup)),
+        },
+      },
+    });
+    const back = await sql("SELECT name FROM groups WHERE id = 'g-restore'");
+    check("restoring brings the group back", restored.ok && back[0]?.name === "restore-me", back);
+    const admins = (await sql("SELECT COUNT(*) AS n FROM users WHERE id = 'admin-1'"))[0]?.n;
+    check("…and leaves existing people alone", admins === 1);
+    const currentKeys = await cdp.send("WebAuthn.getCredentials", { authenticatorId });
+    await restoreDrill(browser, backup, currentKeys.credentials, conn, grafanaSecret);
+    check("fresh database accepts restored passkey and authorizes restored Grafana", true);
   }
 
   step("feedback + update notice");
@@ -1026,7 +1654,7 @@ try {
         check("…and recorded upstream's version", /^\d+\.\d+\.\d+/.test(seen ?? ""), String(seen));
       }
     }
-    await page.goto(`${BASE}/admin/settings`);
+    await page.goto(`${BASE}/admin/settings/about`);
     const bug = await page.getAttribute("#about a[href*='template=bug.yml']", "href");
     const version = (await page.textContent("#about .badge.mono"))?.replace(/^v/, "");
     check(
@@ -1048,7 +1676,7 @@ try {
       "overview says a newer version is out",
       (await page.textContent("body")).includes("v999.0.0 is available"),
     );
-    await page.goto(`${BASE}/admin/settings`);
+    await page.goto(`${BASE}/admin/settings/about`);
     check(
       "settings links to how to update",
       !!(await page.$("#about a[href$='DEPLOY.md#staying-up-to-date']")),

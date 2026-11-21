@@ -35,7 +35,27 @@ export function AccountLede({ user }: { user: User }) {
   );
 }
 
-export function ProfileSection({ user }: { user: User }) {
+function EmailChangeForm() {
+  return (
+    <form method="post" action="/account/email" class="card-body stack-sm email-change">
+      <label class="field">
+        <span class="label">New email</span>
+        <div class="row-sm">
+          <input name="email" type="email" required maxLength={254} autocomplete="email" />
+          <button class="btn" type="submit">
+            Send confirmation link
+          </button>
+        </div>
+        <span class="hint">
+          You'll confirm with your passkey, then open the link we send to the new address. Your
+          current address gets a notice.
+        </span>
+      </label>
+    </form>
+  );
+}
+
+export function ProfileSection({ user, canChangeEmail }: { user: User; canChangeEmail: boolean }) {
   return (
     <section class="card" id="profile">
       <div class="card-head">
@@ -48,20 +68,17 @@ export function ProfileSection({ user }: { user: User }) {
             <span class="label">Name</span>
             <input name="name" required maxLength={120} value={user.name} autocomplete="name" />
           </label>
-          <label class="field">
+          <div class="field">
             <span class="label">Email</span>
-            <input
-              name="email"
-              type="email"
-              required
-              maxLength={254}
-              value={user.email}
-              autocomplete="email"
-            />
+            <input value={user.public ? "None" : user.email} readonly disabled />
             <span class="hint">
-              Apps see this as your email. Your passkeys keep working if you change it.
+              {user.public
+                ? "Accounts made through a public app have no email."
+                : canChangeEmail
+                  ? "Apps see this as your email."
+                  : "Apps see this as your email. Ask an admin to change it."}
             </span>
-          </label>
+          </div>
         </div>
         <div class="card-foot">
           <button class="btn primary right" type="submit">
@@ -69,11 +86,12 @@ export function ProfileSection({ user }: { user: User }) {
           </button>
         </div>
       </form>
+      {canChangeEmail && !user.public ? <EmailChangeForm /> : null}
     </section>
   );
 }
 
-export function PasskeysSection({ creds }: { creds: Credential[] }) {
+export function PasskeysSection({ creds, recovery }: { creds: Credential[]; recovery: string }) {
   return (
     <section class="card" id="passkeys">
       <div class="card-head">
@@ -88,6 +106,11 @@ export function PasskeysSection({ creds }: { creds: Credential[] }) {
             Add passkey
           </button>
         </div>
+      </div>
+      <div class="card-body stack-sm">
+        <h3>Recovery readiness</h3>
+        <p>Name your spare passkey and test it from a device you could use if you lost this one.</p>
+        <p>{recovery}</p>
       </div>
       <p id="account-status" class="status card-status" role="status" aria-live="polite"></p>
       <ul class="list">
@@ -116,6 +139,16 @@ export function PasskeysSection({ creds }: { creds: Credential[] }) {
                   "Never used"
                 )}
               </div>
+            </div>
+            <div class="stack-sm">
+              <button class="btn ghost sm" type="button" data-check-key={k.id}>
+                Test passkey
+              </button>
+              {k.checked_at ? (
+                <span class="meta">
+                  Tested <Time ts={k.checked_at} />
+                </span>
+              ) : null}
             </div>
             <button class="btn ghost sm" type="button" data-open={`rename-${k.id}`}>
               Rename
@@ -181,14 +214,22 @@ export function SessionsSection({
             Browser sessions on {rpName}. Apps keep their own sessions on top of these.
           </div>
         </div>
-        {others > 0 ? (
+        <div class="row-sm">
+          {others > 0 ? (
+            <PostButton
+              action="/account/sessions/revoke-others"
+              label="Sign out other sessions"
+              class="btn sm"
+              confirm="Sign out of every other browser?"
+            />
+          ) : null}
           <PostButton
-            action="/account/sessions/revoke-others"
-            label="Sign out other sessions"
-            class="btn sm"
-            confirm="Sign out of every other browser?"
+            action="/account/sessions/everywhere"
+            label="Sign out everywhere"
+            class="btn sm danger"
+            confirm="Sign out of every browser, including this one, and tell connected apps that support it to sign you out too?"
           />
-        ) : null}
+        </div>
       </div>
       <ul class="list">
         {sessions.map((x) => {

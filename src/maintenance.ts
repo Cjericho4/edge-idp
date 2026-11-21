@@ -22,9 +22,14 @@ export async function runMaintenance(db: D1Database): Promise<Record<string, num
       .bind(now, now - DAY),
     audit_age: db.prepare("DELETE FROM audit_log WHERE created_at < ?1").bind(now - AUDIT_MAX_AGE),
     audit_cap: db.prepare(
-      `DELETE FROM audit_log WHERE id < (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET ${AUDIT_MAX_ROWS})`,
+      `DELETE FROM audit_log WHERE id <= (SELECT MAX(id) FROM audit_log) - ${AUDIT_MAX_ROWS}`,
     ),
     secret_pickups: db.prepare("DELETE FROM secret_pickups WHERE expires_at < ?1").bind(now),
+    email_changes: db.prepare("DELETE FROM email_changes WHERE expires_at < ?1").bind(now),
+    magic_links: db.prepare("DELETE FROM magic_links WHERE expires_at < ?1").bind(now),
+    retired_keys: db
+      .prepare("DELETE FROM signing_keys WHERE id = 'previous' AND retire_at < ?1")
+      .bind(now),
     mcp_calls: db
       .prepare("DELETE FROM mcp_calls WHERE started_at < ?1")
       .bind(now - MCP_CALLS_MAX_AGE),

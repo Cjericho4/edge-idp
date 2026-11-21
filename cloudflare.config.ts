@@ -6,7 +6,7 @@ const STAGES = {
     issuer: "https://auth.johnson.network",
     d1: { name: "identity", id: "832a3094-2375-47b8-aa06-7f146c56eb25" },
     route: { pattern: "auth.johnson.network/*", zone: "johnson.network" },
-    previewUrls: true,
+    previewUrls: false,
     limiters: { auth: "1001", api: "1002" },
   },
   staging: {
@@ -39,6 +39,7 @@ export default defineConfig(({ mode }) => {
         ISSUER: bindings.text(stage.issuer),
         RP_NAME: bindings.text("Johnson ID"),
         SIGNING_KEY_JWK: bindings.secret(),
+        SETUP_TOKEN: bindings.secret(),
         DB: bindings.d1(stage.d1),
         AUTH_LIMITER: bindings.rateLimit({
           namespace: stage.limiters.auth,
@@ -49,6 +50,7 @@ export default defineConfig(({ mode }) => {
           simple: { limit: 300, period: 60 },
         }),
         LOADER: bindings.workerLoader(),
+        EMAIL: bindings.sendEmail(),
       },
     },
   };

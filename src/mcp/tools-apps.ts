@@ -1,8 +1,10 @@
-import { audit, getSetting, listApps, listClients, setSetting } from "../db";
+import { audit, listApps, listClients, setSetting } from "../db";
 import * as ops from "../ops";
 import { nowSec } from "../util";
 import { listAppGroups } from "../access";
 import { createPickup, PICKUP_TTL } from "../secret-pickup";
+import { ACCENTS, getInstanceSettings, invalidateSettingsCache } from "../settings-cache";
+import { emailStatus } from "../email";
 import { clientByRef, obj, str, strList } from "./common";
 import type { ToolDef } from "./common";
 
@@ -108,6 +110,44 @@ export const APP_TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "clients_sign_in_policy",
+    write: true,
+    description:
+      "Sign-in and sign-out policy for an admin-registered client: require a passkey sign-in (not an email link), a sign-in no older than max_auth_age seconds (0, 3600, 43200, 86400 or 604800; 0 means any), and an OIDC back-channel logout URL that gets a logout token when a person is signed out everywhere, disabled, deleted or has their passkeys reset.",
+    inputSchema: obj(
+      {
+        client_id: { type: "string" },
+        require_passkey: { type: "boolean" },
+        max_auth_age: { type: "integer", enum: [0, 3600, 43200, 86400, 604800] },
+        backchannel_logout_uri: {
+          type: "string",
+          description: "https URL for OIDC back-channel logout tokens; empty string removes it",
+        },
+      },
+      ["client_id"],
+    ),
+    handler: async ({ db, env, actor }, args) => {
+      const c = await clientByRef(db, str(args.client_id));
+      await ops.setClientSignInPolicy(
+        db,
+        c,
+        {
+          requirePasskey:
+            typeof args.require_passkey === "boolean" ? args.require_passkey : c.require_passkey,
+          maxAuthAge:
+            typeof args.max_auth_age === "number" ? args.max_auth_age : (c.max_auth_age ?? 0),
+          backchannelUri:
+            typeof args.backchannel_logout_uri === "string"
+              ? args.backchannel_logout_uri
+              : (c.backchannel_logout_uri ?? ""),
+          issuer: env.ISSUER,
+        },
+        actor,
+      );
+      return { ok: true };
+    },
+  },
+  {
     name: "clients_rotate_secret",
     write: true,
     description:
@@ -162,7 +202,7 @@ export const APP_TOOLS: ToolDef[] = [
     name: "apps_create",
     write: true,
     description:
-      "Add an app tile to the launcher. allowed_groups seeds grants (empty = everyone); refine with grants_add. Link it to a client_id to follow that client's allowed groups instead. Pass cf_app_id when the tile fronts a Cloudflare Access application so the admin UI shows it as imported.",
+      "Add an app tile to the launcher. Without client_id, allowed_groups seeds grants (empty = all members). With client_id, use grants_add or inherited app-group grants to give people access to the linked client. Pass cf_app_id when the tile fronts a Cloudflare Access application so the admin UI shows it as imported.",
     inputSchema: obj(
       {
         name: { type: "string" },
@@ -300,15 +340,21 @@ export const APP_TOOLS: ToolDef[] = [
     name: "settings_get",
     write: false,
     description:
-      "Instance settings: name, accent color, dynamic client registration, CIMD support, whether the read-only Cloudflare Access connection is set up.",
+      "Instance settings: name, accent color, dynamic client registration, CIMD support, whether the read-only Cloudflare Access connection is set up, and the security settings (changed only in the admin UI).",
     inputSchema: obj(),
-    handler: async ({ db, env }) => ({
-      name: env.RP_NAME,
-      cloudflare_connected: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID),
-      accent: await getSetting(db, "accent", "indigo"),
-      dcr_enabled: (await getSetting(db, "dcr_enabled", "1")) === "1",
-      cimd_enabled: (await getSetting(db, "cimd_enabled", "1")) === "1",
-    }),
+    handler: async ({ db, env }) => {
+      const s = await getInstanceSettings(db);
+      return {
+        name: env.RP_NAME,
+        accent: s.accent,
+        dcr_enabled: s.dcrEnabled,
+        cimd_enabled: s.cimdEnabled,
+        cloudflare_connected: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID),
+        admin_step_up: s.adminStepUp,
+        sign_in_user_verification: s.signInUv,
+        email: emailStatus(env, s),
+      };
+    },
   },
   {
     name: "settings_set",
@@ -326,7 +372,11 @@ export const APP_TOOLS: ToolDef[] = [
     }),
     handler: async ({ db, actor }, args) => {
       if (typeof args.name === "string") await ops.setInstanceName(db, args.name, actor);
-      if (str(args.accent)) await setSetting(db, "accent", str(args.accent));
+      const accent = str(args.accent);
+      if (accent && !(ACCENTS as readonly string[]).includes(accent))
+        throw new ops.OpError(`Unknown accent. Use one of: ${ACCENTS.join(", ")}`);
+      if (accent) await setSetting(db, "accent", accent);
+      invalidateSettingsCache();
       if (typeof args.dcr_enabled === "boolean")
         await setSetting(db, "dcr_enabled", args.dcr_enabled ? "1" : "0");
       if (typeof args.cimd_enabled === "boolean")

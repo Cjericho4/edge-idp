@@ -11,6 +11,8 @@ export function LoginPage(props: {
   app?: { name: string; host: string; signup?: boolean } | null;
   reauth?: boolean;
   signedOut?: boolean;
+  recovery?: boolean;
+  magicLink?: boolean;
 }) {
   return (
     <AuthLayout
@@ -19,7 +21,9 @@ export function LoginPage(props: {
       page="login"
       below={
         <span>
-          Passkeys only — nothing to remember, nothing to phish.{" "}
+          {props.magicLink
+            ? "No passwords — nothing to remember."
+            : "Passkeys only — nothing to remember, nothing to phish."}{" "}
           <a href="https://passkeys.dev" rel="noopener">
             What's a passkey?
           </a>
@@ -44,7 +48,7 @@ export function LoginPage(props: {
       <h1>{props.reauth ? "Confirm it's you" : "Sign in"}</h1>
       <p class="lede">
         {props.reauth
-          ? "This app asked for a fresh sign-in. Use your passkey to continue."
+          ? "Use your passkey again to continue."
           : "Use Face ID, Touch ID, Windows Hello, or a security key."}
       </p>
       <div
@@ -74,10 +78,33 @@ export function LoginPage(props: {
           </label>
         </details>
         <p id="login-status" class="status" role="status" aria-live="polite"></p>
+        {props.magicLink && !props.reauth ? (
+          <details class="disclose">
+            <summary>
+              <Icon name="send" size="sm" />
+              No passkey on this device? Email me a sign-in link
+            </summary>
+            <form method="post" action="/login/email" class="stack-sm">
+              <input type="hidden" name="next" value={props.next} />
+              <label class="field">
+                <span class="label">Email</span>
+                <input name="email" type="email" required autocomplete="email" />
+              </label>
+              <button class="btn block" type="submit">
+                Send me a link
+              </button>
+            </form>
+          </details>
+        ) : null}
         {props.app?.signup && !props.reauth ? (
           <p class="muted small center">
             New here?{" "}
             <a href={`/signup?next=${encodeURIComponent(props.next)}`}>Create an account</a>
+          </p>
+        ) : null}
+        {props.recovery && !props.reauth ? (
+          <p class="muted small center">
+            <a href="/recover">Lost your passkey?</a>
           </p>
         ) : null}
       </div>
@@ -127,7 +154,7 @@ export function SignupPage(props: {
   );
 }
 
-export function EnrollPage(props: { ui: Ui; name?: string; email?: string; token?: string }) {
+export function EnrollPage(props: { ui: Ui }) {
   return (
     <AuthLayout ui={props.ui} title="Set up your passkey" page="enroll" wide>
       <div class="steps" aria-hidden="true">
@@ -137,16 +164,10 @@ export function EnrollPage(props: { ui: Ui; name?: string; email?: string; token
       <div class="hero-icon">
         <Icon name="fingerprint" />
       </div>
-      <h1>{props.name ? `Welcome, ${props.name.split(" ")[0]}` : "Create your passkey"}</h1>
+      <h1>Create your passkey</h1>
       <p class="lede">
-        You've been invited to <b>{props.ui.rpName}</b>
-        {props.email ? (
-          <>
-            {" "}
-            as <b>{props.email}</b>
-          </>
-        ) : null}
-        . Create a passkey and you're done — no password, ever.
+        You've been invited to <b>{props.ui.rpName}</b>. Create a passkey and you're done — no
+        password, ever.
       </p>
       <ul class="scope-list">
         <li>
@@ -166,7 +187,7 @@ export function EnrollPage(props: { ui: Ui; name?: string; email?: string; token
           </div>
         </li>
       </ul>
-      <div id="enroll-box" data-enrollment-token={props.token ?? ""} class="stack-sm">
+      <div id="enroll-box" class="stack-sm">
         <label class="field">
           <span class="label">Name this passkey (optional)</span>
           <input id="key-name" placeholder="e.g. iPhone, MacBook, YubiKey" maxLength={60} />

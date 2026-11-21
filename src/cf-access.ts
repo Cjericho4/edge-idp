@@ -74,6 +74,7 @@ interface CfPolicy {
   decision: string;
   include?: Rule[];
   require?: Rule[];
+  exclude?: Rule[];
 }
 
 interface CfApp {
@@ -112,6 +113,7 @@ function toApp(r: Record<string, unknown>): CfApp | null {
       decision: optStr(p.decision) ?? "",
       include: toRules(p.include),
       require: toRules(p.require),
+      exclude: toRules(p.exclude),
     })),
   };
 }
@@ -188,11 +190,21 @@ export async function listAccessApps(
               groups.add(o.claim_value);
             }
           }
-          if (p.decision === "allow") {
-            policies.push(
-              `${p.name}: ${(p.include ?? []).map((r) => describeRule(r, ourId)).join(" or ") || "—"}`,
-            );
-          }
+          const clauses = (["include", "require", "exclude"] as const).flatMap((kind) => {
+            const rules = p[kind] ?? [];
+            return rules.length
+              ? [
+                  kind +
+                    " " +
+                    rules
+                      .map((r) => describeRule(r, ourId))
+                      .join(kind === "require" ? " and " : " or "),
+                ]
+              : [];
+          });
+          policies.push(
+            [p.name || "Policy", p.decision || "Decision unavailable", ...clauses].join(" · "),
+          );
         }
         return {
           id: a.id,
@@ -206,4 +218,27 @@ export async function listAccessApps(
         };
       }),
   };
+}
+
+export async function revokeAccessSessions(env: Env, email: string): Promise<void> {
+  const { token, accountId } = credsOf(env);
+  const res = await fetch(`${API}/accounts/${accountId}/access/organizations/revoke_user`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "user-agent": "edge-idp",
+    },
+    body: JSON.stringify({ email }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body: unknown = await res.json().catch(() => null);
+  const envelope = isRecord(body) ? body : {};
+  if (!res.ok || envelope.success !== true) {
+    const msg = records(envelope.errors)
+      .map((e) => optStr(e.message) ?? "")
+      .filter(Boolean)
+      .join("; ");
+    throw new Error(msg || `Cloudflare API ${res.status}`);
+  }
 }

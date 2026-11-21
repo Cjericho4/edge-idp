@@ -1,6 +1,6 @@
 # edge-idp
 
-A passkey-only identity provider for your personal stuff, on Cloudflare
+A passkey-first identity provider for your personal stuff, on Cloudflare
 Workers + D1. One sign-in (Face ID / Touch ID / a security key) for every app
 you and your people use: Cloudflare Access apps, anything that speaks OpenID
 Connect, and AI assistants over MCP.
@@ -16,7 +16,10 @@ Or clone, set a few values in `cloudflare.config.ts`, run migrations,
 
 **For everyone who signs in**
 
-- Passkeys only: no passwords, no codes, no reset emails to phish
+- Passkeys first: no passwords. Optionally, members can sign in with an
+  emailed one-time link (never admins), and each app can insist on a passkey
+  or a recent sign-in
+- Test a named spare passkey and see the recovery options for your account
 - A home screen of the apps they're allowed to use
 - Account & security: passkeys (with provider names like iCloud Keychain or
   YubiKey), where they're signed in, connected apps and AI tools, recent activity
@@ -25,29 +28,43 @@ Or clone, set a few values in `cloudflare.config.ts`, run migrations,
 
 **For you (admin)**
 
-- People: invite with a one-time link (copy, email, share sheet, or QR for a
-  phone), groups, roles, recovery (reset passkeys), disable, delete
-- Groups in ID tokens and in access tokens granted the `groups` scope, so
-  Access policies and authorized apps can match on them
-- Access grants: give a user, a group or everyone access to an app or an app
+- People: invite with a one-time link (emailed for you, or copy, share sheet,
+  or QR for a phone), invite several at once, see and resend or revoke
+  pending invites, groups, roles, recovery (reset passkeys), disable, delete
+- Groups in ID tokens (third-party clients only when they ask for the
+  `groups` scope) and in access tokens granted that scope, so Access policies
+  and authorized apps can match on them
+- Access grants: give a user, a group or all members access to an app or an app
   group, with an optional role; Cloudflare Access receives an `apps` claim to
   match its policies on, and each app that signs in here receives only its own
   `roles`
+- Explain access for a person and app, including a hidden tile or denied sign-in
+- Preview a backup restore and inspect the per-table receipt
 - Public sign-up per app: open one app (say, a game) to the public and anyone
   can create a name-and-passkey account for it, contained to apps you opened
-- Connect an app in one step (MCP `apps_connect`): templates for Grafana, Open
+- Preview or connect an app (Admin → Connect or MCP `apps_connect`): templates for Grafana, Open
   WebUI, LiteLLM, Immich, Paperless-ngx and any OIDC app create the client, link it to
-  the launcher and return the app-side settings; the client secret is handed
-  over through a one-time pickup instead of the response
+  the launcher and return the app-side settings; a new client secret is handed
+  over through a one-time pickup. Retrying keeps the working credential
 - Apps: the launcher, organized into app groups, with favorites and search;
   optional import of your Cloudflare Access apps and their policies (read-only)
+- Lost passkeys: off (you send a new link), or a "Lost your passkey?" request
+  you approve, or an emailed one-hour link straight away
+- Sign-out that reaches apps: OIDC back-channel logout, and optionally
+  ending Cloudflare Access sessions, when someone is disabled or signed out
+  everywhere
+- Alerts for chosen events by email and webhooks (Discord, Slack, ntfy or
+  signed JSON), and security notices to the people affected
 - Clients: OIDC/OAuth clients, both confidential and public, with exact
   redirect matching, per-client groups, PKCE and consent settings
 - Overview: sign-in trends, most-used apps, and "needs attention" items (only
   one admin, people without a passkey, expiring tokens, security events)
 - Audit log with categories, search and CSV export
-- Settings: rename the instance, pick an accent color, control how AI tools
-  register, and connect a read-only Cloudflare token for the Access import
+- Settings, one tab per area: name and accent color; sign-in and security
+  (how often admins recheck their passkey, whether sign-in needs Face ID /
+  Touch ID / a PIN); optional email through Cloudflare Email Service; how AI
+  tools may register; the issuer and signing keys; the Cloudflare Access
+  import; version and runtime
 - ⌘K command palette, light and dark modes
 
 **Standards**
@@ -65,13 +82,13 @@ Or clone, set a few values in `cloudflare.config.ts`, run migrations,
   - RFC 9207 `iss` in the authorization response
 - Admin MCP server (works with both the current and the 2026-07-28 protocol
   versions):
-  - about 30 tools
+  - about 40 tools
   - a sandboxed `execute` code mode
   - read-only tokens, with step-up to write access when needed
 
 ## What it deliberately doesn't do
 
-Passwords, TOTP, magic links, SAML, LDAP, social logins. See
+Passwords, TOTP, SAML, LDAP, social logins. See
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the reasoning behind every
 auth decision.
 
@@ -85,8 +102,9 @@ npm run db:migrate:local          # local D1
 npm run dev                       # cf dev on http://localhost:8787 (see DEPLOY.md → Local development)
 ```
 
-Checks, all self-contained (each boots a throwaway local instance and leaves
-nothing behind):
+Checks. Everything except `npm run smoke` is self-contained (each boots a
+throwaway local instance and leaves nothing behind); smoke sends read-only
+requests to the live deployment:
 
 ```bash
 npm run typecheck && npm run gates   # types, lint, complexity, dead code, secrets, …
@@ -114,7 +132,7 @@ src/
   webauthn.ts        passkey ceremonies + enrollment
   session.ts         __Host- cookie sessions (hashed at rest)
   crypto.ts          RS256 ID/access tokens, JWKS with rotation
-  mcp.ts             admin MCP server + code-mode sandbox
+  mcp.ts             admin MCP server (code-mode sandbox in mcp/sandbox.ts)
   ops.ts             domain operations shared by the admin UI and MCP
   account.tsx        account & security routes (views in account-sections.tsx)
   home.tsx           home launcher
@@ -131,10 +149,10 @@ cloudflare.config.ts Worker config for the cf CLI (bindings, route, cron, accoun
 wrangler.jsonc       portable template for the Deploy to Cloudflare button and forks
 tests/
   e2e/               full, api and one-click suites + instances.mjs (throwaway servers)
-  security/          regression scripts from the October 2026 security review
+  security/          regression scripts from the October 2026 security reviews
   smoke/             read-only post-deploy checks (tester-army/e2e)
   unit.test.ts       unit tests
-scripts/             build, deploy, migrations, keys, seeding, smoke runner
+scripts/             build, deploy, migrations (+ additive check), keys, seeding, smoke runner
 docs/                threat model, architecture, testing; archive/ holds superseded research and reviews
 ```
 

@@ -65,6 +65,7 @@ export interface TokenClaims {
   public?: boolean;
   apps?: string[];
   roles?: string[];
+  method?: string | null;
 }
 
 export const ID_TOKEN_TTL = 3600;
@@ -74,19 +75,21 @@ export async function mintIdToken(
   env: Env,
   claims: TokenClaims,
   audience: string,
+  scopedTo?: string[],
 ): Promise<string> {
   const { key, kid } = await getSigningKey(env);
   const now = nowSec();
+  const allows = (scope: string) => !scopedTo || scopedTo.includes(scope);
   return await new jose.SignJWT({
-    ...(claims.public
+    ...(claims.public || !allows("email")
       ? {}
       : { email: claims.email, email_verified: true, preferred_username: claims.email }),
-    name: claims.name,
-    groups: claims.groups,
+    ...(allows("profile") ? { name: claims.name } : {}),
+    ...(allows("groups") ? { groups: claims.groups } : {}),
     ...(claims.apps ? { apps: claims.apps } : {}),
     ...(claims.roles ? { roles: claims.roles } : {}),
     auth_time: claims.authTime,
-    amr: ["pop", "user"],
+    amr: claims.method === "email" ? ["otp"] : ["pop", "user"],
     ...(claims.nonce ? { nonce: claims.nonce } : {}),
   })
     .setProtectedHeader({ alg: "RS256", kid, typ: "JWT" })
@@ -123,6 +126,22 @@ export async function mintAccessToken(
     .setJti(newId())
     .setIssuedAt(now)
     .setExpirationTime(now + ACCESS_TOKEN_TTL)
+    .sign(key);
+}
+
+export async function mintLogoutToken(env: Env, sub: string, audience: string): Promise<string> {
+  const { key, kid } = await getSigningKey(env);
+  const now = nowSec();
+  return await new jose.SignJWT({
+    events: { "http://schemas.openid.net/event/backchannel-logout": {} },
+  })
+    .setProtectedHeader({ alg: "RS256", kid, typ: "logout+jwt" })
+    .setSubject(sub)
+    .setIssuer(env.ISSUER)
+    .setAudience(audience)
+    .setJti(newId())
+    .setIssuedAt(now)
+    .setExpirationTime(now + 120)
     .sign(key);
 }
 

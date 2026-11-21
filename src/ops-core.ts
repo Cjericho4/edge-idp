@@ -4,7 +4,7 @@ export class OpError extends Error {}
 
 export interface Actor {
   adminId: string;
-  via: "ui" | "mcp";
+  via: "ui" | "mcp" | "system";
 }
 
 export const by = (a: Actor, extra: Record<string, unknown> = {}) => ({
@@ -12,6 +12,8 @@ export const by = (a: Actor, extra: Record<string, unknown> = {}) => ({
   via: a.via,
   ...extra,
 });
+
+export const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 export function parseRedirectUris(input: string | string[]): string[] {
   const list = (Array.isArray(input) ? input : input.split(/[\r\n,]+/))

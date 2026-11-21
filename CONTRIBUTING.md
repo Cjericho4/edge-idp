@@ -13,14 +13,15 @@ here. Please leave out tokens, keys, enrollment links and anything else private.
    button install is a standalone copy with no link back here), then branch.
 2. `npm install` and `npx playwright install chromium`.
 3. Make the change. Keep it small and in the existing style; the project is
-   deliberately passkey-only (see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)).
+   deliberately passkey-first, with no passwords ever (see
+   [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)).
    Source code has no comments: put the reasoning in
    [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) or the threat model, and
    update them when behavior changes.
 4. Before opening a PR:
 
    ```bash
-   npm run typecheck && npm run gates
+   npm run typecheck && npm run gates && npm run db:check
    npm test                  # unit tests (parsers / algorithms only)
    npm run test:e2e          # the full end-to-end suite
    npm run test:e2e:setup    # the one-click install path
@@ -33,5 +34,6 @@ here. Please leave out tokens, keys, enrollment links and anything else private.
 5. Open a PR describing what changed and why. Auth-relevant changes should
    say what threat they address or touch.
 
-Releases bump `version` in `package.json`; installs compare against it to
-show "update available".
+Releases bump `version` in `package.json` and add a `CHANGELOG.md` entry
+(upgrade notes first); installs compare against the version to show "update
+available", and the About tab links to the changelog.

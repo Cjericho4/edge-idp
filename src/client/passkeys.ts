@@ -17,20 +17,30 @@ function status(elId: string, msg: string, kind: "" | "error" | "ok" = ""): void
   el.classList.toggle("ok", kind === "ok");
 }
 
+const ERROR_NAMES: Record<string, string> = {
+  NotAllowedError: "Cancelled — no problem. Try again when you're ready.",
+  InvalidStateError: "This device already has a passkey here. Try signing in instead.",
+  SecurityError: "This site's address doesn't match its passkey domain. Tell your admin.",
+};
+
+const ERROR_CODES: Record<string, string> = {
+  auth_failed: "That passkey isn't recognized here. Was it removed?",
+  invalid_enrollment_token: "This enrollment link was already used or has expired.",
+  rate_limited: "Too many attempts — wait a minute and try again.",
+  invalid_name: "Pick a name up to 60 characters.",
+  signup_closed: "This app isn't taking new accounts right now.",
+  already_signed_in: "You're already signed in.",
+  uv_required:
+    "Admins confirm with Face ID, Touch ID, Windows Hello or the key's PIN. Sign in again and you'll be asked.",
+  passkey_not_discoverable:
+    "This passkey can't be found without an email. Use a passkey manager (phone, laptop or a password manager).",
+};
+
 function friendlyError(e: unknown): string {
+  if (e instanceof Error && e.message === "uv_required") requireUv = true;
   if (e instanceof Error) {
-    if (e.name === "NotAllowedError") return "Cancelled — no problem. Try again when you're ready.";
-    if (e.name === "InvalidStateError")
-      return "This device already has a passkey here. Try signing in instead.";
-    if (e.name === "SecurityError")
-      return "This site's address doesn't match its passkey domain. Tell your admin.";
-    if (e.message === "auth_failed") return "That passkey isn't recognized here. Was it removed?";
-    if (e.message === "invalid_enrollment_token")
-      return "This enrollment link was already used or has expired.";
-    if (e.message === "rate_limited") return "Too many attempts — wait a minute and try again.";
-    if (e.message === "invalid_name") return "Pick a name up to 60 characters.";
-    if (e.message === "signup_closed") return "This app isn't taking new accounts right now.";
-    if (e.message === "already_signed_in") return "You're already signed in.";
+    const text = ERROR_NAMES[e.name] ?? ERROR_CODES[e.message];
+    if (text) return text;
   }
   return "Something went wrong — please try again.";
 }
@@ -60,16 +70,22 @@ const isAuthOptions = (v: unknown): v is PublicKeyCredentialRequestOptionsJSON =
 const isRegOptions = (v: unknown): v is PublicKeyCredentialCreationOptionsJSON =>
   isRecord(v) && typeof v.challenge === "string" && isRecord(v.rp) && isRecord(v.user);
 
+let requireUv = false;
+
 async function attemptLogin(
   email: string | undefined,
   autofill: boolean,
   stepUp: boolean,
 ): Promise<boolean> {
-  const raw = await postJSON("/webauthn/auth/options", email ? { email } : {});
+  const raw = await postJSON("/webauthn/auth/options", {
+    ...(email ? { email } : {}),
+    stepUp,
+    requireUv,
+  });
   if (!isAuthOptions(raw)) throw new Error("bad_response");
   const resp = await startAuthentication({ optionsJSON: raw, useBrowserAutofill: autofill });
   if (!resp) return false;
-  const result = await postJSON("/webauthn/auth/verify", { response: resp, email, stepUp });
+  const result = await postJSON("/webauthn/auth/verify", { response: resp, email });
   return result.ok === true;
 }
 
@@ -105,7 +121,11 @@ export async function initLogin(): Promise<void> {
         if (ok) finish();
         return ok;
       })
-      .catch(() => false);
+      .catch((e: unknown) => {
+        if (e instanceof Error && e.message === "uv_required")
+          status("login-status", friendlyError(e), "error");
+        return false;
+      });
   }
   btn?.addEventListener("click", () => void onLoginClick(btn, finish, stepUp));
 }
@@ -136,7 +156,7 @@ async function register(body: Record<string, unknown>, name: string): Promise<bo
 export function initEnroll(): void {
   const box = $("enroll-box");
   if (!box) return;
-  const token = window.location.hash.slice(1) || box.getAttribute("data-enrollment-token") || "";
+  const token = window.location.hash.slice(1);
   const btn = $("enroll-btn");
   if (!token) {
     status("enroll-status", "Open the enrollment link your admin sent you.", "error");
@@ -163,7 +183,28 @@ async function onEnrollClick(btn: HTMLElement, token: string): Promise<void> {
   }
 }
 
+async function checkPasskey(btn: HTMLElement) {
+  setBusy(btn, true);
+  try {
+    const options = await postJSON("/webauthn/check/options", { key: btn.dataset.checkKey });
+    if (!isAuthOptions(options)) throw new Error("bad_response");
+    const response = await startAuthentication({ optionsJSON: options });
+    const result = await postJSON("/webauthn/auth/verify", { response });
+    if (result.checked === true) {
+      history.replaceState(null, "", "/account#passkeys");
+      window.location.reload();
+    }
+  } catch (e) {
+    status("account-status", friendlyError(e), "error");
+  } finally {
+    setBusy(btn, false);
+  }
+}
+
 export function initAccount(): void {
+  $$("[data-check-key]").forEach((btn) =>
+    btn.addEventListener("click", () => void checkPasskey(btn)),
+  );
   const btn = $("add-key-btn");
   btn?.addEventListener("click", () => void onAddKeyClick(btn));
 }

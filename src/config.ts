@@ -12,6 +12,8 @@ export interface Env {
   API_LIMITER?: RateLimit;
   CF_API_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
+  EMAIL?: SendEmail;
+  SIGNING_KEY_SOURCE?: "secret" | "database";
 }
 
 export function isLocalIssuer(issuer: string): boolean {

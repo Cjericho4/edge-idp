@@ -1,11 +1,14 @@
+import { inspectAccess } from "../access-inspection";
 import { Hono } from "hono";
-import { getCredentialsForUser, getUser, getUserGroups, listGroups } from "../db";
+import { getCredentialsForUser, getUser, listGroups } from "../db";
 import type { User } from "../db";
 import { nowSec } from "../util";
 import type { AdminVars } from "./shell";
 import { page } from "./shell";
-import { Avatar, PageHead, PostButton } from "../ui/components";
-import { userAccess } from "../access";
+import { emailOn } from "./invites";
+import { Avatar, Dialog, PageHead, PostButton } from "../ui/components";
+import { Icon } from "../ui/icons";
+import { loadUserContext } from "../access";
 import {
   ActivityTab,
   AppAccessTab,
@@ -32,10 +35,11 @@ async function loadTabData(
   id: string,
   user: User,
   self: boolean,
+  inspect?: string,
 ): Promise<TabData> {
-  const [creds, groups, allGroups, sessions, grants, activity, access] = await Promise.all([
+  const [creds, ctx, allGroups, sessions, grants, activity] = await Promise.all([
     getCredentialsForUser(db, id),
-    getUserGroups(db, id),
+    loadUserContext(db, id),
     listGroups(db),
     db
       .prepare(
@@ -68,9 +72,13 @@ async function loadTabData(
       )
       .bind(id)
       .all<{ event: string; created_at: number; client_name: string | null }>(),
-    userAccess(db, id),
   ]);
+  const groups = ctx?.groups ?? [];
+  const access = { apps: ctx?.apps ?? [], access: ctx?.access ?? new Map<string, string[]>() };
+  const chosen = ctx?.apps.find((app) => app.id === inspect);
   return {
+    apps: access.apps,
+    inspection: ctx && chosen ? await inspectAccess(db, ctx, chosen) : null,
     id,
     self,
     user,
@@ -106,29 +114,46 @@ function UserActions({
   user,
   self,
   hasPasskey,
+  emailReady,
 }: {
   user: User;
   self: boolean;
   hasPasskey: boolean;
+  emailReady: boolean;
 }) {
   const id = user.id;
+  const send = emailReady && !user.public;
   return (
     <>
       {user.public ? (
-        <PostButton
-          action={`/admin/users/${id}/member`}
-          label="Make member"
-          icon="userPlus"
-          class="btn"
-          confirm={`Make ${user.name} a member? Members can open apps granted to everyone and sign in to members-only apps, subject to their grants.`}
-        />
+        <>
+          <button class="btn" type="button" data-open="make-member">
+            <Icon name="userPlus" size="sm" />
+            <span>Make member</span>
+          </button>
+          <Dialog
+            id="make-member"
+            title={`Make ${user.name} a member`}
+            lede="Members can open apps granted to everyone and sign in to members-only apps, subject to their grants. Apps will see this email as verified."
+            action={`/admin/users/${id}/member`}
+            submit="Make member"
+          >
+            <label class="field">
+              <span class="label">Their email</span>
+              <input name="email" type="email" required maxLength={254} autocomplete="off" />
+            </label>
+          </Dialog>
+        </>
       ) : null}
-      <PostButton
-        action={`/admin/users/${id}/enrollment`}
-        label={hasPasskey ? "New enrollment link" : "Get invite link"}
-        icon="link"
-        class="btn"
-      />
+      {self ? null : (
+        <PostButton
+          action={`/admin/users/${id}/enrollment`}
+          label={send ? "Email a new link" : hasPasskey ? "New enrollment link" : "Get invite link"}
+          icon={send ? "send" : "link"}
+          class="btn"
+          fields={send ? { sendEmail: "1" } : {}}
+        />
+      )}
       {self ? null : user.disabled ? (
         <PostButton action={`/admin/users/${id}/enable`} label="Enable" icon="check" class="btn" />
       ) : (
@@ -151,7 +176,13 @@ userDetailAdmin.get("/", async (c) => {
   if (!user) return c.notFound();
   const tab = TABS.find((t) => t.id === c.req.query("tab"))?.id ?? "overview";
   const self = id === c.get("admin").id;
-  const data = await loadTabData(db, id, user, self);
+  const data = await loadTabData(
+    db,
+    id,
+    user,
+    self,
+    tab === "access" ? c.req.query("app") : undefined,
+  );
   const { creds } = data;
   const counts: Record<string, number> = {
     passkeys: creds.length,
@@ -171,7 +202,14 @@ userDetailAdmin.get("/", async (c) => {
         leading={<Avatar name={user.name} seed={user.id} size="lg" />}
         title={user.name}
         lede={<UserLede user={user} hasPasskey={creds.length > 0} />}
-        actions={<UserActions user={user} self={self} hasPasskey={creds.length > 0} />}
+        actions={
+          <UserActions
+            user={user}
+            self={self}
+            hasPasskey={creds.length > 0}
+            emailReady={await emailOn(c)}
+          />
+        }
       />
       <nav class="tabs">
         {TABS.map((t) => (

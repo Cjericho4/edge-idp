@@ -1,5 +1,12 @@
 import { execFileSync, spawn } from "node:child_process";
-import { copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateLocal, sqlRows, stageConfig, stopGroup } from "../../scripts/cf-local.mjs";
@@ -51,17 +58,34 @@ function server(cmd, args, work, base) {
   return { start, stop, log: () => log };
 }
 
+export function outboxFrom(log) {
+  const clean = log.replace(/\x1b\[[0-9;]*m/g, "");
+  return clean
+    .split("send_email binding called with MessageBuilder:")
+    .slice(1)
+    .map((block) => {
+      const lines = block.split("\n").slice(0, 12);
+      const field = (name) =>
+        lines
+          .find((l) => l.startsWith(`${name}: `))
+          ?.slice(name.length + 2)
+          .trim() ?? "";
+      let text = "";
+      try {
+        text = field("Text") ? readFileSync(field("Text"), "utf8") : "";
+      } catch {}
+      return { from: field("From"), to: field("To"), subject: field("Subject"), text };
+    });
+}
+
 function cleanup(work) {
   if (!process.env.E2E_KEEP) rmSync(work, { recursive: true, force: true });
 }
 
-export async function startLocal({ issuer, rpName = "E2E Identity", port }) {
+export async function startLocal({ issuer, rpName = "E2E Identity", port, vars = {} }) {
   const jwk = execFileSync("node", ["scripts/gen-key.mjs"], { encoding: "utf8" }).trim();
-  const work = projectCopy("e2e", "cloudflare.config.ts", {
-    ISSUER: issuer,
-    RP_NAME: rpName,
-    SIGNING_KEY_JWK: jwk,
-  });
+  const initial = { ISSUER: issuer, RP_NAME: rpName, SIGNING_KEY_JWK: jwk, ...vars };
+  const work = projectCopy("e2e", "cloudflare.config.ts", initial);
   const state = join(work, ".wrangler", "state");
   await migrateLocal(state);
   const base = `http://localhost:${port}`;
@@ -77,6 +101,17 @@ export async function startLocal({ issuer, rpName = "E2E Identity", port }) {
     work,
     sql: (command) => sqlRows(command, { persistTo: state }),
     log: srv.log,
+    outbox: () => outboxFrom(srv.log()),
+    restart: async (next) => {
+      await srv.stop();
+      writeFileSync(
+        join(work, ".dev.vars"),
+        Object.entries(next(initial))
+          .map(([k, v]) => `${k}='${v}'\n`)
+          .join(""),
+      );
+      await srv.start();
+    },
     stop: async () => {
       await srv.stop();
       cleanup(work);

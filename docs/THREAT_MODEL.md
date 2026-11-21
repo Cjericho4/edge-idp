@@ -8,13 +8,22 @@ Code references use the form `src/file.ts › symbol`. How the pieces fit
 together is in [ARCHITECTURE.md](ARCHITECTURE.md); how each property is tested
 is in [TESTING.md](TESTING.md).
 
-## Credentials: passkeys only
+## Credentials: passkeys first
 
-There is no password column, no password reset flow, and no fallback factor.
+There is no password column and no password reset flow. Passkeys are the only
+credential unless an admin turns on email sign-in links for members (see
+_Email sign-in links_), and nothing but a passkey ever signs an admin in.
 That deletes credential stuffing, password spraying, and reset-token phishing
-in one move, at the cost that account recovery is admin-assisted (revoke keys,
-then send a fresh enrollment link). Users are nudged to enroll two passkeys
-(phone and laptop) so losing one device is a non-event.
+in one move, at the cost that account recovery goes through a fresh
+enrollment link, sent by an admin or, if an admin allows it, by email
+(see _Account recovery_). Users are nudged to enroll two passkeys (phone and
+laptop) so losing one device is a non-event.
+
+A signed-in user can test a selected passkey. The server requires user
+verification and binds the challenge to the session hash, owner and credential
+ID. A successful assertion records the check without issuing a session or
+updating the session's step-up time (`src/passkey-check.ts`,
+`src/webauthn.ts › /auth/verify`).
 
 A user cannot remove their own last passkey from Account & security; the
 handler refuses a deletion that would leave zero credentials, so nobody can
@@ -32,13 +41,30 @@ verifies cannot both get it (`src/webauthn-challenges.ts › takeChallenge`).
 `expectedOrigin` is the exact `ISSUER` origin and `expectedRPID` its hostname,
 so a credential registered on a lookalike domain can never verify here.
 
-User verification is **required** for both registration and authentication:
-`userVerification: "required"` in the options and `requireUserVerification:
-true` at verify. Owning or touching the device is not enough to authenticate
-to a service that is the root of trust for every app. ID tokens say so with
-`amr: ["pop", "user"]` (RFC 8176: proof of possession plus user presence and
-verification) (`src/webauthn.ts › /register/options, /auth/options`,
-`src/crypto.ts › mintIdToken`).
+User verification (Face ID, Touch ID, a PIN) is **required** by default for
+registration and authentication: `userVerification: "required"` in the options
+and `requireUserVerification: true` at verify. Owning or touching the device
+should not be enough to authenticate to a service that is the root of trust
+for every app.
+
+Admins can relax this for **sign-in only** (Settings › Sign-in & security,
+"Verify the person at sign-in"), which asks for `discouraged`. The cost is
+explicit in the UI: a found or stolen unlocked device or security key is then
+enough to sign in. Whether the biometric prompt actually disappears is the
+passkey provider's decision; Apple's passkeys usually still ask. Registration,
+sign-up and passkey rechecks always require verification, so the relaxed
+setting never weakens step-up. The requirement is decided when the challenge is
+issued and stored with it; verify enforces the stored value, never anything
+the browser sends (`src/webauthn.ts › /auth/options, verifyAssertion`). ID
+tokens keep `amr: ["pop", "user"]`: RFC 8176 defines `user` as a user-presence
+test, which every WebAuthn assertion includes, so the claim stays accurate
+either way (`src/crypto.ts › mintIdToken`).
+
+"Admins always verify" (on by default) keeps admins out of the relaxation: an
+admin's assertion without the UV flag is refused with `uv_required`, and the
+sign-in page asks again with verification required. It is checked after the
+signature, on the flag the authenticator signed, so a modified client can't
+skip it (`src/webauthn.ts › assertionProblem`).
 
 Algorithms are pinned to ES256 and RS256
 (`supportedAlgorithmIDs: [-7, -257]`). Without the pin, SimpleWebAuthn v14
@@ -125,13 +151,19 @@ attacker-controllable input and must not be trusted to carry a request that
 
 RP-initiated logout redirects only to a `post_logout_redirect_uri` whose
 origin matches one of the client's registered redirect URIs (the client comes
-from `client_id` or a verified `id_token_hint`), so `/end-session` cannot be
-used as an open redirect (`src/oidc.tsx › postLogoutTarget`).
+from `client_id` or a verified `id_token_hint`), and only for admin-registered
+clients. Anyone can register a client through DCR or CIMD, so honoring their
+redirect URIs would hand an attacker a redirect from the IdP's hostname. Only
+https and http loopback origins count: every custom scheme (`cursor://`,
+`javascript:`) has the opaque origin `"null"`, which would otherwise match
+everything opaque. Anything else falls back to the sign-in page, so
+`/end-session` cannot be used as an open redirect
+(`src/oidc.tsx › postLogoutTarget, webOrigin`).
 
 The `next` parameter on `/login` accepts only same-origin relative paths.
 Values starting with `//` (protocol-relative) or `/\` (which browsers treat as
 `//`) fall back to `/`, so a fresh login can never be redirected off-site
-(`src/index.tsx › safeNext`).
+(`src/util.ts › safeNext`).
 
 ## Client secret pickup
 
@@ -144,7 +176,9 @@ consumes it, so two racing pickups can't both get the secret), expires after
 10 minutes, and travels in the POST body, never a URL. The row stores the
 secret AES-GCM-encrypted under a key derived from the token, and only the
 token's hash, so a D1 read during those 10 minutes yields nothing usable. The
-endpoint is rate-limited with the authentication budget, unused rows are
+initial pickup and connection are written atomically. A repeat connection
+cannot recover a spent pickup or rotate credentials. The pickup endpoint
+is rate-limited with the authentication budget, unused rows are
 purged by the hourly cron, and each pickup is audited
 (`src/secret-pickup.ts`). The admin UI still shows a new secret once, on
 screen, to the admin.
@@ -187,7 +221,12 @@ Redirect URIs for dynamic clients may be https, http loopback (any port, RFC
 8252 §7.3) or a private-use app scheme; `javascript:`/`data:`/`file:` and
 similar are rejected. Dynamically registered clients that never received a
 consent are deleted after 30 days, since some MCP clients register again on
-every connect. Both onboarding paths can be switched off in Settings.
+every connect. At most 1,000 such unused registrations exist at a time; beyond
+that `/register` answers 503 until the cron or consents free room, so a
+registration flood from many IPs (which the per-IP limit can't stop) is
+bounded in storage, at the cost of new DCR clients waiting during the flood
+(`src/oauth-clients.ts › tooManyPendingClients`). Both onboarding paths can be
+switched off in Settings.
 
 ## Sessions and cross-origin requests
 
@@ -220,6 +259,31 @@ user must match the challenge's user. A stolen session cookie must not be
 enough to persist access by planting a new credential, or to strip the
 owner's.
 
+Admins are the accounts this matters most for, and the admin UI can mint
+credentials and privilege on its own, so sensitive admin actions need the same
+recheck: inviting people, enrollment links, passkey resets and removals, role
+and member changes, email edits, API tokens, OAuth client create/edit/rotate,
+and every Settings change (`src/admin/index.ts › SENSITIVE`). Without one the
+admin is sent to confirm with their passkey and back to the page. So is
+`/authorize` for the `mcp` and `mcp:read` scopes, because otherwise a stolen
+session could finish an OAuth flow with a client the attacker registered and
+leave with an admin MCP token (`src/oidc.tsx › needsAdminStepUp`; `prompt=none`
+gets `login_required`). Admins can't mint enrollment links for, reset, or
+remove passkeys from their own account at all; that is what Account & security
+is for (`src/ops.ts › mintEnrollmentLink, revokePasskeys, removePasskey`).
+
+The recheck window is a setting (Settings › Security): 5 minutes by default,
+15 minutes, an hour, or off for installs that accept the trade. Changing it is
+itself a sensitive action, so a stolen session can't relax it first. The
+security settings are readable over MCP but changeable only in the admin UI,
+like the Cloudflare token. MCP `settings_set` can still change the name,
+accent and the DCR/CIMD toggles: an MCP credential is already an admin
+credential that took a recheck to mint (an API token or an `mcp`-scoped
+grant), which stands in for the UI's per-action recheck. With the recheck off
+and sign-in verification relaxed together, an unlocked device that holds an
+admin's passkey is enough to do everything an admin can; the Settings copy
+says so.
+
 Flash messages use a `__Host-flash` cookie, so no sibling subdomain can set it
 and plant text on our pages. The `?ok=` codes in URLs map through a fixed
 dictionary; arbitrary text from the URL is never echoed (`src/ui/layout.tsx ›
@@ -250,6 +314,124 @@ ceremonies race on one link, only one enrolls; the other gets
 `invalid_enrollment_token` (`src/webauthn.ts › burnEnrollmentToken`). Admins
 generate tokens: becoming a member is always the admin's explicit intent. A
 fresh link is revealed once in the admin UI and never stored in plaintext.
+Minting a link deletes the person's older unused ones in the same batch, so
+at most one live link per person exists at any time; "Resend" and "Revoke"
+on Admin › People › Pending invites act on that one
+(`src/ops.ts › mintEnrollmentLink`, `src/invites.ts › revokeInvites`).
+
+With email set up, the admin can have the link emailed instead of copying
+it. The email carries the same bearer link, so whoever reads that inbox can
+enroll a passkey, exactly as if the admin had pasted the link into a chat;
+the admin still sees the link on screen as a fallback. Invites never go to a
+public account (it has no address) (`src/invites.ts › deliverLink`).
+
+## Email sign-in links (optional)
+
+Off by default. When an admin turns it on (Settings › Sign-in & security) and
+email is sending, the sign-in page offers "Email me a sign-in link". This is
+the one way in that isn't a passkey, so it is fenced in:
+
+- **Members only.** Admins and public accounts never get a link, whatever
+  address is typed; the answer is the same for every address, so it can't
+  find accounts. At most one link per person per minute, on the
+  authentication rate limit.
+- **The link is a bearer token like an enrollment link:** 256-bit, hashed at
+  rest, single-use (`DELETE … RETURNING`), 10 minutes, in the URL fragment
+  so it never reaches a log.
+- **Two steps.** Opening the link shows whose account it signs in to and
+  needs a second click. A forwarded link, or one an attacker sends for their
+  own account, can't sign someone in without them seeing the name.
+- **The session says how it was made.** It is an `email` session. It can't
+  open the admin UI, can't recheck (that takes a passkey), and therefore
+  can't add a passkey, change the email or do anything else behind a
+  recheck. Codes and refresh tokens carry the method, and ID tokens say
+  `amr: ["otp"]` instead of `["pop", "user"]`.
+- **Apps can refuse it.** A client's sign-in policy can require a passkey
+  sign-in, or a sign-in no older than an hour, 12 hours, a day or a week; an
+  `email` session (or a stale one) is sent back to sign in with a passkey
+  before a code is issued (`src/oidc.tsx › needsFreshSignIn`).
+- **Every use is announced.** The person gets a security notice after each
+  email sign-in, and it's an alertable event.
+
+The cost is stated in the setting: email can be phished and inboxes get
+compromised, so a member's inbox becomes a way into every app they can use
+that doesn't require a passkey (`src/magic-link.ts`, `src/login-link.tsx`).
+
+## Signing out of apps
+
+Ending someone's sessions here doesn't end the sessions apps made from their
+tokens. Two optional mechanisms reach further when a person is disabled,
+deleted, has their passkeys reset, or is signed out everywhere (by an admin,
+over MCP, or from their own Account & security). A plain "Sign out" ends only
+the session here, by design: signing out of one browser shouldn't sign
+someone out of every app.
+
+- **OIDC Back-Channel Logout** for admin-registered clients that set a
+  back-channel logout URL (the client page, or MCP `clients_sign_in_policy`).
+  The token endpoint records which clients each person has signed in to
+  (`client_signins`), and each of those gets a signed logout token
+  (`typ: logout+jwt`, `iss`, `aud` = the client, `sub`, `jti`, the
+  back-channel `events` claim, two-minute expiry, never a `nonce`; no `sid`,
+  since logout is per person) posted as `logout_token`. The URL follows the
+  webhook rules (https, public host, no redirects, 5-second timeout), and
+  each delivery is audited with its status
+  (`src/app-logout.ts`, `src/crypto.ts › mintLogoutToken`).
+- **Cloudflare Access session revocation**, off by default (Settings ›
+  Cloudflare). Revoking needs a token permission that can also edit Access's
+  identity providers and groups, so it is refused unless the token is the
+  `CF_API_TOKEN` Worker secret: a token with that power must not sit in D1,
+  where anyone who can read the database could take it and repoint Access
+  (`src/ops-settings.ts › setAccessRevocation`).
+
+Both run after the response and never block or fail the action that
+triggered them.
+
+## Account recovery (optional)
+
+"Lost your passkey?" is off by default; then the sign-in page doesn't offer
+it, `/recover` answers 404, and recovery is the admin sending a new
+enrollment link. Settings › Sign-in › Lost passkeys has two other modes:
+
+- **An admin approves.** The person enters their email at `/recover`; a
+  pending request appears on the Overview and goes to admin alerts.
+  Approving mints a one-hour enrollment link (emailed if email is on). The
+  admin is asked to confirm the request really came from that person,
+  because anyone can type an address in.
+- **Email a link right away.** The link goes straight to the address on the
+  account. This makes the inbox a way into the account: anyone who can read
+  a member's email can add a passkey. The setting says so. Admins are never
+  served automatically; their requests wait for another admin, and an admin
+  can't approve their own.
+
+Either way the answer at `/recover` is the same whether or not the address
+exists, so it can't be used to find accounts. Public accounts and disabled
+ones get nothing. The link is an ordinary enrollment link with a one-hour
+TTL, so it is single-use, hashed, and replaces any older unused link; the
+person's other passkeys keep working. Each person has at most one pending
+request. `/recover` is on the authentication rate limit, and every request,
+approval and email is audited (`src/recovery.ts`, `src/recover.tsx`).
+
+## Alerts, webhooks and notices
+
+Audited events can reach admins by email, any number of webhooks, and the
+person concerned (Settings › Notifications). Sending happens after the
+response, through `waitUntil`, so a slow or failing receiver never slows or
+fails the action it reports (`src/notify.ts › dispatch`).
+
+Webhook URLs are entered by admins but are still outbound requests from the
+root of trust, so they get the same treatment as client metadata fetches:
+https only, a public hostname (no IP literals, no localhost, no single-label
+names), no credentials in the URL, redirects not followed, a 5-second
+timeout, and the response body discarded. Plain-http loopback is accepted
+only when the issuer itself is local, for development
+(`src/outbound.ts › outboundUrlProblem`). A webhook can carry a signing
+secret; requests then include `x-edge-idp-signature: sha256=<HMAC of the
+body>`. The secret is shown to admins so the receiver can be configured.
+
+Payloads name the person (and their email) and the app involved, so choose
+where you send them. Security notices go only to the person concerned, never
+to public accounts, and skip the first passkey of a new account. All of
+these settings are behind the admin recheck.
 
 ## Public sign-up
 
@@ -266,8 +448,9 @@ contained rather than trusted:
   (`src/oauth-shared.ts › clientAccessProblem`). That includes Cloudflare
   Access, whose client admits every member. Dynamically registered and CIMD
   clients can't be opened at all.
-- **It has no email.** Sign-up never asks for one, so there is no unverified
-  address to impersonate someone with. The required column holds a
+- **It has no email.** Sign-up never asks for one and Account & security
+  never offers to set one, so there is no unverified address to impersonate
+  someone with. The required column holds a
   placeholder (`<id>@public.invalid`) that is never put in a token:
   `email`, `email_verified` and `preferred_username` are left out of ID
   tokens, access tokens and `/userinfo` (`src/crypto.ts › mintIdToken`).
@@ -278,7 +461,9 @@ contained rather than trusted:
   which is what an admin grants a public app to.
 - **It can't be an admin.** Making a public account an admin is refused;
   an admin has to make it a member first, and that is the only way out of
-  the containment.
+  the containment. "Make member" requires the person's real email, because
+  from then on apps receive it as verified; the placeholder is refused
+  (`src/ops.ts › makeMember`).
 - **Creation is atomic and late.** The account, its passkey and its group
   membership are written in one batch only after the passkey verifies, with
   the client re-checked at that moment, so abandoned ceremonies leave nothing
@@ -297,7 +482,12 @@ client, disable or delete accounts, or make individual ones members.
 `/setup` creates the first admin, then hands off to normal passkey
 enrollment. It exists only while the users table is empty and only when the
 installer set a generated 32-byte base64url `SETUP_TOKEN` secret (43
-characters) at deploy time. The token is compared in constant time, the
+characters) at deploy time. Setup refuses a token that doesn't look generated:
+it must be base64url, at least 43 characters, and use at least 16 distinct
+characters, which a random token always does and `aaaa…` or a short phrase
+padded out doesn't (`src/setup.tsx › strongSetupToken`). The check is on setup
+only, not on the D1 key encryption that also uses the token, so an existing
+install with a weak token keeps running. The token is compared in constant time, the
 endpoint is on the AUTH rate limit and the same-origin guard, wrong guesses
 are audited (`SETUP_REJECTED`), and the insert is conditional on "no users
 yet", so two racing requests can't both create an admin. After the first user
@@ -332,10 +522,52 @@ The portable installation uses these defaults:
   long-lived `SETUP_TOKEN` Worker secret. A D1 read alone no longer exports
   signing authority. D1 writes can still change users, sessions and keys;
   Worker secret compromise remains critical. D1 backups and the matching
-  `SETUP_TOKEN` are both required to recover this key. The reference instance
-  uses the `SIGNING_KEY_JWK` secret, which takes precedence. Legacy plaintext
-  portable rows fail closed until the operator rotates to a secret-held key
+  `SETUP_TOKEN` are both required to recover this key. A `SIGNING_KEY_JWK`
+  secret takes precedence. Legacy plaintext portable rows fail closed until
+  the operator rotates to a secret-held key
   (`src/instance.ts › sealKey, openKey`).
+- **Rotation** of a database-held key happens in Settings › Identity & keys,
+  or on a schedule (90, 180 or 365 days, off by default) from the hourly
+  job. The current row becomes `previous` with a `retire_at` two hours out, so
+  every token it signed (1-hour TTL) keeps verifying, and a new encrypted key
+  becomes `current`, all in one batch. `previous` is read on every request
+  like `current` and leaves JWKS the moment it retires; the cron deletes it.
+  Rotations are audited and alertable (`src/key-rotation.ts`).
+- **Moving a secret-held key into the database** (Settings › Identity & keys)
+  seals the same JWK under `SETUP_TOKEN`, so no token stops verifying; it
+  takes effect once the operator deletes the `SIGNING_KEY_JWK` secret, which
+  keeps winning until then. It needs a generated `SETUP_TOKEN` secret, which
+  on an instance with users never reopens `/setup`. The trade is the one
+  above: the key is then as safe as `SETUP_TOKEN` and D1 together rather
+  than a Worker secret alone (`src/key-rotation.ts › moveKeyToDatabase`).
+
+## Backups
+
+Settings › Backup downloads people, their passkeys' public keys, memberships,
+groups, app groups, apps, grants, favorites, OIDC clients (with secret
+hashes), webhooks (with their URLs and signing secrets) and settings as one
+JSON file. It never includes sessions, codes, refresh or API tokens,
+enrollment links, signing keys, the audit log or the stored Cloudflare token,
+so a stolen backup can't sign anyone in or mint tokens; it still names
+everyone and holds webhook URLs that are often secrets, so the page says to
+treat it like a password. Downloading and restoring are behind the recheck
+and audited.
+
+Restoring is an untrusted-input path even though only admins reach it. The
+file must be an `edge-idp-backup` version 1, at most 5 MB; every column name
+must be a plain identifier and every value a string, number, null or a
+base64url blob, and only columns that exist in the live table are written
+(`src/backup.ts › parseBackup, rowStatement`). Configuration rows replace the
+ones with the same id; people, memberships, favorites and passkeys are only
+added, so a restore never changes or removes anyone who is already here.
+Passkeys are restored only when the backup's passkey domain matches, since a
+credential bound to another RP ID could never verify here. Webhook URLs and
+back-channel logout URLs go through the same outbound URL rules as when an
+admin enters them: a webhook that fails is skipped, a back-channel URL that
+fails is cleared (`src/backup.ts › safeOutbound`). A preview reads existing
+keys without applying SQL writes. The browser requires the same file digest
+when applying the reviewed file. The receipt and import audit give counts
+per table without storing the backup or any of its field values.
 
 ## Admin surface
 
@@ -346,6 +578,24 @@ Disabling a user deletes their sessions and refresh tokens immediately;
 revoking keys kills sessions too, so recovery starts from a clean slate.
 Admins can't disable themselves (avoids the one-admin lockout).
 
+Emails are set by admins unless an admin turns on self-service changes. ID
+tokens assert `email_verified: true`, and Cloudflare Access policies and many
+apps trust that claim to match or link accounts, so a change must prove
+control of the new address, or any member could claim someone else's.
+Account & security's profile form saves only the name
+(`src/account.tsx › /account/profile`); an admin edit behind the recheck is
+the proof by default.
+
+Self-service change (Settings › Email, off by default, only while email is
+sending) needs three things: a passkey recheck in the last 5 minutes, so a
+stolen session alone can't start one; a 256-bit single-use link (hashed,
+1-hour TTL, `DELETE … RETURNING`) sent to the new address, so nothing changes
+until its owner opens it; and a notice to the old address afterwards, so the
+owner learns about a change they didn't make. Starting a change is on the
+authentication rate limit, so it can't be used to spam an inbox. The address
+must still be free when the link is opened. Public accounts can't use it
+(`src/email-change.ts › startEmailChange, confirmEmailChange`).
+
 Emails are stored as entered but looked up by a lowercased key, so an admin
 who retypes an existing email in different case cannot create a duplicate
 account. SQLite's `lower()` folds only ASCII, so the app's key does the same
@@ -353,10 +603,22 @@ account. SQLite's `lower()` folds only ASCII, so the app's key does the same
 must match exactly, and the stored address always finds itself
 (`src/db.ts › getUserByEmail`).
 
+## Email (optional)
+
+Email is a delivery channel, never a credential on its own: what it carries
+and when is described with each feature that sends it. The sender address
+and the on/off switch are settings, so changing them needs the admin
+recheck. Messages are rendered with escaping on every value, so a display
+name can't inject markup into someone's inbox (`src/email.ts › renderMail`).
+A failed send is reported to the admin as Cloudflare returned it and never
+retried silently; nothing that needs a link depends on email arriving,
+because the same link is always available to an admin as a fallback.
+
 ## Cloudflare API token (optional)
 
 The read-only Access integration needs a Cloudflare API token. Admins can
-connect it in Settings, which stores it in `instance_settings` in plaintext.
+connect a read-only one in Settings, which stores it in `instance_settings` in
+plaintext.
 That is acceptable because of what the token can do and what an attacker would
 already have: it should carry only Access read permissions (apps, policies,
 identity providers), so it can't change anything, and reading D1 already means
@@ -374,10 +636,20 @@ not EdDSA or HS256, and signing with anything else would silently break the
 integration this server exists for. Verification pins `algorithms:
 ["RS256"]` as well (`src/crypto.ts`).
 
+Sign-in policy is per admin-registered client: "require a passkey sign-in"
+and "maximum sign-in age" are checked at `/authorize` alongside `prompt` and
+`max_age`, and a failing session is sent to sign in again rather than given a
+code (`src/oidc.tsx › needsFreshSignIn`, `src/admin/client-policy.tsx`).
+
 ID tokens are RS256 JWTs (`typ: JWT`) with `aud` set to the client, a 1-hour
 TTL, and `auth_time` taken from the passkey ceremony (not the mint time).
 Everything Cloudflare Access needs (email, groups) is **in** the ID token
-because Access never calls userinfo.
+because Access never calls userinfo, so admin-registered clients get email,
+name and groups whatever scopes they asked for. Clients that introduce
+themselves (DCR, CIMD) get only what their scopes cover: `email` for the email
+claims, `profile` for the name, `groups` for groups. A tool that asked for
+`openid` alone learns the subject and nothing else
+(`src/crypto.ts › mintIdToken`, `src/oauth-token.ts › tokenResponse`).
 
 Access-grant claims follow the audience: a token says only what its recipient
 needs (`src/access.ts › claimsForClient`). They go only to admin-registered
@@ -393,8 +665,8 @@ clients that request the `groups` scope, in the ID token, the access token and
   identity Access holds, so roles there would leak each app's permissions to
   all the others, and apps that sit only behind Access can't enforce roles
   anyway.
-- Clients that introduce themselves (DCR, CIMD) still get `groups` but neither
-  claim: a third-party tool has no business learning every service in the
+- Clients that introduce themselves (DCR, CIMD) get `groups` when they ask for
+  it, but neither claim: a third-party tool has no business learning every service in the
   household or who administers which one.
 
 Like `groups`, these claims are read at sign-in, so Cloudflare Access sees a
@@ -428,10 +700,12 @@ can still be recognized, then the hourly cron deletes them. Refresh tokens
 also die with the user's consent, admin role, group eligibility, or account.
 Wrong-client presentations do not consume or revoke another client's grant.
 
-New enrollment links put the bearer token in a URL fragment (`/enroll#<token>`)
-so the Worker and Workers Logs never receive it. Previously issued path-token
-links (`/enroll/:token`) remain usable until they expire; replace outstanding
-links if their URL was logged.
+Enrollment links put the bearer token in a URL fragment (`/enroll#<token>`),
+from the admin UI, MCP, `/setup` and `scripts/seed-admin.mjs` alike, so the
+Worker, Workers Logs and Sentry never receive it. The enrollment page sends
+`Referrer-Policy: no-referrer`; the global header is set only when a route
+hasn't chosen its own (`src/index.tsx › securityHeaders`). The old path-token
+route (`/enroll/:token`) is gone.
 
 ## Admin API (MCP) credentials
 
@@ -450,7 +724,11 @@ which the host sets when it creates the stub; sandboxed code can't see or
 forge props, so it can't impersonate another admin or lift a read-only
 restriction. The sandbox's return value is parsed and shape-checked rather
 than trusted, because model-written code produced it (`src/mcp/sandbox.ts ›
-IdCodeSandbox.callTool, parseOutcome`).
+IdCodeSandbox.callTool, parseOutcome`). A run may make at most 50 tool calls,
+counted when each call starts so `Promise.all` can't overshoot it, with 1 s of
+CPU and a 10 s wall-clock limit. The wall-clock limit stops waiting for the
+run; Dynamic Workers have no cancel, so calls already in flight finish, each
+still checked by the host.
 
 ## What v1 does NOT do (and why that's fine)
 
@@ -459,9 +737,10 @@ IdCodeSandbox.callTool, parseOutcome`).
   and `/register` fail closed when `AUTH_LIMITER` is absent; other endpoints
   still benefit from an edge WAF backstop (DEPLOY.md). An hourly cron purges
   expired rows, so transient spam is bounded by storage quota and cleanup.
-- **Key rotation is two secrets, not a UI.** Publish the old key as
-  `SIGNING_KEY_JWK_PREVIOUS` while the new one signs (DEPLOY.md). Tokens last
-  1 hour, which bounds the overlap.
+- **Key rotation for a secret-held key is two secrets.** Publish the old key
+  as `SIGNING_KEY_JWK_PREVIOUS` while the new one signs (DEPLOY.md). Tokens
+  last 1 hour, which bounds the overlap. Database-held keys rotate from the UI
+  (see _Issuer and signing key defaults_).
 - **IPs are hashed** (`ip_hash`) in sessions and audit logs: enough for the
   admin to spot anomalies, not enough to be a PII honeypot.
 - **Audit log is bounded** to 365 days or the newest 50k events, enforced by

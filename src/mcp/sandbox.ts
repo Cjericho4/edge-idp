@@ -1,4 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { withScope } from "../request-context";
 import type { Env } from "../config";
 import { resolveEnv } from "../instance";
 import * as ops from "../ops";
@@ -44,9 +45,11 @@ export class IdCodeSandbox extends WorkerEntrypoint<Env> {
       throw new Error(`${name} needs write access; this token is read-only`);
     try {
       const env = await resolveEnv(this.env, props.issuer);
-      return await tool.handler(
-        { db: this.env.DB, env, actor: { adminId: props.adminId, via: "mcp" } },
-        args ?? {},
+      return await withScope({ env, wait: (p) => this.ctx.waitUntil(p) }, () =>
+        tool.handler(
+          { db: this.env.DB, env, actor: { adminId: props.adminId, via: "mcp" } },
+          args ?? {},
+        ),
       );
     } catch (e) {
       throw new Error(e instanceof ops.OpError ? e.message : `Internal error: ${errMessage(e)}`, {
@@ -64,6 +67,7 @@ export class Agent extends WorkerEntrypoint {
     const ID = this.env.ID;
     const logs = [];
     const toolCalls = [];
+    let started = 0;
     let logChars = 0;
     const fmt = (a) => {
       if (typeof a === "string") return a.slice(0, 2000);
@@ -86,7 +90,8 @@ export class Agent extends WorkerEntrypoint {
         if (name === "then") return undefined;
         const tool = String(name);
         return async (args) => {
-          if (toolCalls.length >= 50) throw new Error("execute tool-call limit reached");
+          if (started >= 50) throw new Error("execute tool-call limit reached");
+          started++;
           const t0 = Date.now();
           try {
             const r = await ID.callTool(tool, args || {});
